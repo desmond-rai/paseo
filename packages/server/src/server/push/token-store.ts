@@ -1,73 +1,132 @@
-import type pino from "pino";
 import { existsSync, readFileSync } from "node:fs";
+import type { DatabaseSync } from "node:sqlite";
+import type pino from "pino";
+import { z } from "zod";
+import { hasLegacyImportMarker, recordLegacyImportMarker } from "../db/legacy-imports.js";
+import { runInTransaction } from "../db/transaction.js";
+import { ensurePrivateFile } from "../private-files.js";
 
-import { ensurePrivateFile, writePrivateFileAtomicSync } from "../private-files.js";
+const LEGACY_IMPORT_STORE = "push_tokens";
+const PushTokenRecordSchema = z.object({
+  token: z.string().trim().min(1),
+});
 
-/**
- * Store for Expo push tokens.
- *
- * Tokens are persisted to disk so pushes still work after daemon restarts.
- */
+interface PushTokenStoreOptions {
+  database: DatabaseSync;
+  legacyFilePath: string;
+  logger: pino.Logger;
+}
+
+interface PushTokenRow {
+  payload: string;
+}
+
+/** Store for Expo push tokens. */
 export class PushTokenStore {
+  private readonly database: DatabaseSync;
   private readonly logger: pino.Logger;
-  private tokens: Set<string> = new Set();
-  private readonly filePath: string;
+  private readonly legacyFilePath: string;
 
-  constructor(logger: pino.Logger, filePath: string) {
-    this.logger = logger.child({ component: "token-store" });
-    this.filePath = filePath;
-    this.loadFromDisk();
+  constructor(options: PushTokenStoreOptions) {
+    this.database = options.database;
+    this.logger = options.logger.child({ component: "token-store" });
+    this.legacyFilePath = options.legacyFilePath;
+    this.importLegacyTokens();
   }
 
   addToken(token: string): void {
-    const normalized = token.trim();
-    if (!normalized) return;
-    if (this.tokens.has(normalized)) return;
-    this.tokens.add(normalized);
-    this.persist();
-    this.logger.debug({ total: this.tokens.size }, "Added token");
+    const parsed = PushTokenRecordSchema.safeParse({ token });
+    if (!parsed.success) {
+      return;
+    }
+    const result = this.database
+      .prepare("INSERT OR IGNORE INTO push_tokens (token, payload) VALUES (?, ?)")
+      .run(parsed.data.token, JSON.stringify(parsed.data));
+    if (result.changes > 0) {
+      this.logger.debug({ total: this.count() }, "Added token");
+    }
   }
 
   removeToken(token: string): void {
     const normalized = token.trim();
-    if (!normalized) return;
-    const deleted = this.tokens.delete(normalized);
-    if (deleted) {
-      this.persist();
-      this.logger.debug({ total: this.tokens.size }, "Removed token");
+    if (!normalized) {
+      return;
+    }
+    const result = this.database.prepare("DELETE FROM push_tokens WHERE token = ?").run(normalized);
+    if (result.changes > 0) {
+      this.logger.debug({ total: this.count() }, "Removed token");
     }
   }
 
   getAllTokens(): string[] {
-    return Array.from(this.tokens);
+    const rows = this.database
+      .prepare("SELECT payload FROM push_tokens ORDER BY rowid")
+      .all() as unknown as PushTokenRow[];
+    return rows.map((row) => PushTokenRecordSchema.parse(JSON.parse(row.payload)).token);
   }
 
-  private loadFromDisk(): void {
-    try {
-      if (!existsSync(this.filePath)) {
-        return;
-      }
-      ensurePrivateFile(this.filePath);
-      const raw = readFileSync(this.filePath, "utf-8");
-      const parsed = JSON.parse(raw) as { tokens?: unknown };
-      const tokens = Array.isArray(parsed.tokens)
-        ? parsed.tokens.filter((t): t is string => typeof t === "string" && t.trim().length > 0)
-        : [];
-      this.tokens = new Set(tokens.map((t) => t.trim()));
-      this.logger.info({ total: this.tokens.size }, "Loaded push tokens");
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      this.logger.warn({ err }, "Failed to load push tokens");
+  private count(): number {
+    const row = this.database.prepare("SELECT count(*) AS count FROM push_tokens").get() as {
+      count: number;
+    };
+    return row.count;
+  }
+
+  private importLegacyTokens(): void {
+    if (hasLegacyImportMarker(this.database, LEGACY_IMPORT_STORE)) {
+      return;
     }
-  }
 
-  private persist(): void {
     try {
-      const payload = JSON.stringify({ tokens: Array.from(this.tokens) }, null, 2) + "\n";
-      writePrivateFileAtomicSync(this.filePath, payload);
+      runInTransaction(this.database, () => {
+        let importedCount = 0;
+        let skippedCount = 0;
+        if (this.count() === 0 && existsSync(this.legacyFilePath)) {
+          ensurePrivateFile(this.legacyFilePath);
+          const raw = readFileSync(this.legacyFilePath, "utf-8");
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(raw);
+          } catch (error) {
+            this.logger.warn(
+              { err: error, filePath: this.legacyFilePath },
+              "Skipping invalid legacy push token file",
+            );
+            skippedCount += 1;
+          }
+
+          const tokens =
+            parsed &&
+            typeof parsed === "object" &&
+            Array.isArray((parsed as { tokens?: unknown }).tokens)
+              ? (parsed as { tokens: unknown[] }).tokens
+              : [];
+          for (const token of tokens) {
+            const record = PushTokenRecordSchema.safeParse({ token });
+            if (!record.success) {
+              skippedCount += 1;
+              this.logger.warn(
+                { filePath: this.legacyFilePath, err: record.error },
+                "Skipping invalid legacy push token",
+              );
+              continue;
+            }
+            const result = this.database
+              .prepare("INSERT OR IGNORE INTO push_tokens (token, payload) VALUES (?, ?)")
+              .run(record.data.token, JSON.stringify(record.data));
+            importedCount += Number(result.changes);
+          }
+        }
+        recordLegacyImportMarker(this.database, LEGACY_IMPORT_STORE, {
+          importedCount,
+          skippedCount,
+        });
+        this.logger.info({ importedCount, skippedCount }, "Legacy push token import complete");
+      });
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      this.logger.warn({ err }, "Failed to persist push tokens");
+      throw new Error(`Failed to import legacy push tokens from ${this.legacyFilePath}`, {
+        cause: error,
+      });
     }
   }
 }

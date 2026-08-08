@@ -216,6 +216,8 @@ import {
   type HubRelationshipRemote,
 } from "./hub/relationship-remote.js";
 import { DaemonExecutions } from "./hub/daemon-executions.js";
+import { openDatabase } from "./db/open.js";
+import { PushTokenStore } from "./push/token-store.js";
 
 const MAX_MCP_DEBUG_BATCH_ITEMS = 10;
 const REDACTED_LOG_VALUE = "[redacted]";
@@ -546,6 +548,7 @@ export async function createPaseoDaemon(
 ): Promise<PaseoDaemon> {
   configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
   const logger = rootLogger.child({ module: "bootstrap" });
+  const database = openDatabase(config.paseoHome);
   const bootstrapStart = performance.now();
   const elapsed = () => `${(performance.now() - bootstrapStart).toFixed(0)}ms`;
   const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
@@ -1197,6 +1200,7 @@ export async function createPaseoDaemon(
   };
   const scheduleService = new ScheduleService({
     paseoHome: config.paseoHome,
+    database,
     logger,
     agentManager,
     agentStorage,
@@ -1214,6 +1218,11 @@ export async function createPaseoDaemon(
     }
   });
   logger.info({ elapsed: elapsed() }, "Schedule service initialized");
+  const pushTokenStore = new PushTokenStore({
+    database,
+    legacyFilePath: path.join(config.paseoHome, "push-tokens.json"),
+    logger,
+  });
   logger.info({ elapsed: elapsed() }, "Loading persisted agent registry");
   const persistedRecords = await agentStorage.list();
   logger.info(
@@ -1495,6 +1504,7 @@ export async function createPaseoDaemon(
               agentManager,
               agentStorage,
               downloadTokenStore,
+              pushTokenStore,
               config.paseoHome,
               daemonConfigStore,
               mcpBaseUrl,
@@ -1638,6 +1648,7 @@ export async function createPaseoDaemon(
     if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
       unlinkSync(listenTarget.path);
     }
+    database.close();
   };
 
   return {
