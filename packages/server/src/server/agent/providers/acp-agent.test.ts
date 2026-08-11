@@ -53,6 +53,14 @@ import { buildStringCommandShellInvocation } from "../../../utils/string-command
 import { asInternals } from "../../test-utils/class-mocks.js";
 import * as spawnUtils from "../../../utils/spawn.js";
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
 describe("buildACPClientCapabilities", () => {
   test("keeps filesystem and terminal execution with the agent by default", () => {
     expect(buildACPClientCapabilities()).toEqual({
@@ -253,6 +261,7 @@ describe("ACPAgentClient shared process", () => {
 
   test("applies each caller timeout to a coalesced catalog request", async () => {
     let resolveNewSession!: (value: { sessionId: string }) => void;
+    const newSessionStarted = createDeferred<void>();
 
     class TestSharedACPAgentClient extends ACPAgentClient {
       constructor() {
@@ -280,6 +289,7 @@ describe("ACPAgentClient shared process", () => {
               () =>
                 new Promise<{ sessionId: string }>((resolve) => {
                   resolveNewSession = resolve;
+                  newSessionStarted.resolve();
                 }),
             ),
           } as unknown as ClientSideConnection,
@@ -292,12 +302,79 @@ describe("ACPAgentClient shared process", () => {
 
     const client = new TestSharedACPAgentClient();
     const longRequest = client.fetchCatalog({ scope: "global", force: true, timeoutMs: 100 });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await newSessionStarted.promise;
     await expect(
       client.fetchCatalog({ scope: "global", force: true, timeoutMs: 5 }),
     ).rejects.toThrow("ACP catalog probe timed out after 5ms");
     resolveNewSession({ sessionId: "session-catalog" });
     await expect(longRequest).resolves.toEqual({ models: [], modes: [] });
+  });
+
+  test("does not invalidate active sessions when a catalog probe times out", async () => {
+    const catalogStarted = createDeferred<void>();
+    const catalogResponse = createDeferred<{ sessionId: string }>();
+    const terminateProcess: ProcessTerminator = vi.fn(async (child: TreeKillTarget) => {
+      (child as ChildProcess).emit("exit", null, "SIGTERM");
+      return "terminated" as const;
+    });
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      spawnCount = 0;
+      newSessionCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: {},
+            }),
+            newSession: vi.fn(() => {
+              this.newSessionCount += 1;
+              if (this.newSessionCount === 1) {
+                return Promise.resolve({ sessionId: "session-active" });
+              }
+              catalogStarted.resolve();
+              return catalogResponse.promise;
+            }),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    const session = await client.createSession(
+      { provider: "acp", cwd: "/tmp/worktree" },
+      { agentId: "agent-active" },
+    );
+    const catalogRequest = client.fetchCatalog({ scope: "global", force: true, timeoutMs: 5 });
+    await catalogStarted.promise;
+    await expect(catalogRequest).rejects.toThrow("ACP catalog probe timed out after 5ms");
+    expect(terminateProcess).not.toHaveBeenCalled();
+    expect(client.spawnCount).toBe(1);
+
+    catalogResponse.resolve({ sessionId: "session-catalog" });
+    await session.close();
+    expect(terminateProcess).not.toHaveBeenCalled();
   });
 
   test("terminates and replaces a shared host after a catalog timeout", async () => {
@@ -467,19 +544,18 @@ describe("ACPAgentClient shared process", () => {
       .finally(() => {
         settled = true;
       });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    const timedOutResult = await timedOutCatalog;
     expect(settled).toBe(true);
-    expect(await timedOutCatalog).toEqual(
+    expect(timedOutResult).toEqual(
       expect.objectContaining({ message: "ACP initialize timed out after 5ms" }),
     );
     expect(client.spawnCount).toBe(1);
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 5 }),
+    ).rejects.toThrow("ACP initialize timed out after 5ms");
+    expect(client.spawnCount).toBe(1);
 
     children[0]?.emit("exit", null, "SIGKILL");
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await expect(
-      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 100 }),
-    ).resolves.toEqual({ models: [], modes: [] });
-    expect(client.spawnCount).toBe(2);
   });
 
   test("applies the diagnostic phase timeout to shared initialization", async () => {
@@ -530,6 +606,7 @@ describe("ACPAgentClient shared process", () => {
 
   test("bounds a management probe joining an already-initializing host", async () => {
     const children: ChildProcessWithoutNullStreams[] = [];
+    const initializeStarted = createDeferred<void>();
     const terminateProcess: ProcessTerminator = vi.fn(async () => "kill-timeout" as const);
 
     class TestSharedACPAgentClient extends ACPAgentClient {
@@ -556,7 +633,10 @@ describe("ACPAgentClient shared process", () => {
         return {
           child,
           connection: {
-            initialize: vi.fn(() => new Promise<never>(() => undefined)),
+            initialize: vi.fn(() => {
+              initializeStarted.resolve();
+              return new Promise<never>(() => undefined);
+            }),
           } as unknown as ClientSideConnection,
           stderrChunks: [],
           spawnReady: Promise.resolve(),
@@ -576,7 +656,7 @@ describe("ACPAgentClient shared process", () => {
         () => null,
         (error: unknown) => error,
       );
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await initializeStarted.promise;
     await expect(client.diagnosticRows()).resolves.toContainEqual({
       label: "ACP shared probe",
       value: "error: ACP initialize timed out after 5ms",

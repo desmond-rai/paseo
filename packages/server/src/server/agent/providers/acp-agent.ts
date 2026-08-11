@@ -514,6 +514,7 @@ interface ACPSharedProcessLease {
   connection: ClientSideConnection;
   initialize: InitializeResponse;
   register(sessionId: string, client: ACPSharedRouteTarget): void;
+  hasOtherReferences(): boolean;
   release(sessionId: string | null): void;
   invalidate(reason: Error): Promise<void>;
 }
@@ -1197,7 +1198,11 @@ export class ACPAgentClient implements AgentClient {
       return await withTimeout(request, remainingTimeoutMs, timeoutMessage);
     } catch (error) {
       if (!requestSettled) {
-        await sharedProcess.invalidate(new Error(timeoutMessage));
+        const hasOtherReferences = sharedProcess.hasOtherReferences();
+        sharedProcess.release(null);
+        if (!hasOtherReferences) {
+          await sharedProcess.invalidate(new Error(timeoutMessage));
+        }
       }
       throw error;
     }
@@ -3553,6 +3558,7 @@ class ACPSharedProcessHost {
       register: (sessionId, client) => {
         this.router.register(sessionId, client);
       },
+      hasOtherReferences: () => this.references > 1,
       invalidate: (reason) => this.invalidate(reason),
       release: (sessionId) => {
         if (released) {
