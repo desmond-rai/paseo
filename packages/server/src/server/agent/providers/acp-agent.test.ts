@@ -8,6 +8,7 @@ import {
   RequestError,
   ndJsonStream,
   type Agent,
+  type Client as ACPClient,
   PermissionOption,
   PromptResponse,
   RequestPermissionRequest,
@@ -18,6 +19,7 @@ import {
 import {
   ACPAgentClient,
   ACPAgentSession,
+  type ACPProcessTransport,
   type SpawnedACPProcess,
   type SessionStateResponse,
   buildACPClientCapabilities,
@@ -81,6 +83,637 @@ describe("buildACPClientCapabilities", () => {
       terminal: true,
       _meta: { source: "provider" },
     });
+  });
+});
+
+describe("ACPAgentClient shared process", () => {
+  test("coalesces catalog probes and creates ten sessions on one process", async () => {
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      readonly newSession = vi.fn(async () => ({
+        sessionId: `session-${this.newSession.mock.calls.length}`,
+      }));
+      readonly listSessions = vi.fn(async () => ({ sessions: [] }));
+      readonly launchEnvs: Array<Record<string, string> | undefined> = [];
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+        });
+      }
+
+      protected override async spawnTransport(
+        launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        this.launchEnvs.push(launchEnv);
+        clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { list: {} } },
+            }),
+            newSession: this.newSession,
+            listSessions: this.listSessions,
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+
+      diagnosticRows() {
+        return this.buildACPProbeDiagnosticRows();
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    const catalogs = await Promise.all(
+      Array.from({ length: 10 }, () => client.fetchCatalog({ scope: "global", force: true })),
+    );
+    expect(catalogs).toHaveLength(10);
+    expect(client.spawnCount).toBe(1);
+    expect(client.newSession).toHaveBeenCalledTimes(1);
+
+    const sessions = await Promise.all(
+      Array.from({ length: 10 }, (_, index) =>
+        client.createSession(
+          { provider: "acp", cwd: `/tmp/worktree-${index + 1}` },
+          {
+            agentId: `agent-${index + 1}`,
+            env: {
+              PASEO_AGENT_ID: `agent-${index + 1}`,
+              PASEO_AGENT_CWD: `/tmp/worktree-${index + 1}`,
+            },
+          },
+        ),
+      ),
+    );
+
+    expect(client.spawnCount).toBe(1);
+    expect(client.newSession).toHaveBeenCalledTimes(11);
+    expect(new Set(sessions.map((session) => session.id)).size).toBe(10);
+    expect(client.launchEnvs).toEqual([undefined]);
+    await expect(
+      client.createSession(
+        { provider: "acp", cwd: "/tmp/different" },
+        {
+          agentId: "different-agent",
+          env: {
+            PASEO_AGENT_ID: "different-agent",
+            PASEO_AGENT_CWD: "/tmp/different",
+            PASEO_WORKSPACE_ID: "different-workspace",
+            SHARED_VALUE: "different",
+          },
+        },
+      ),
+    ).rejects.toThrow("Shared ACP sessions require the same launch environment");
+    await expect(client.listImportableSessions()).resolves.toEqual([]);
+    const diagnosticRows = await client.diagnosticRows();
+    expect(diagnosticRows).toContainEqual({ label: "ACP initialize", value: "ok (shared)" });
+    expect(client.spawnCount).toBe(1);
+    expect(client.newSession).toHaveBeenCalledTimes(12);
+    await Promise.all(sessions.map((session) => session.close()));
+  });
+
+  test("preserves caller launch variables while removing agent-scoped values", async () => {
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      launchEnv: Record<string, string> | undefined;
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+        });
+      }
+
+      protected override async spawnTransport(
+        launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        this.launchEnv = launchEnv;
+        clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: { sessionCapabilities: { list: {} } },
+            }),
+            newSession: vi.fn().mockResolvedValue({ sessionId: "session-env" }),
+            listSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+
+      diagnosticRows() {
+        return this.buildACPProbeDiagnosticRows();
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    const session = await client.createSession(
+      { provider: "acp", cwd: "/tmp/worktree" },
+      {
+        agentId: "agent-env",
+        env: {
+          PASEO_AGENT_ID: "agent-env",
+          PASEO_AGENT_CWD: "/tmp/worktree",
+          PASEO_WORKSPACE_ID: "workspace-env",
+          CUSTOM_ENDPOINT: "https://example.test",
+        },
+      },
+    );
+
+    expect(client.launchEnv).toEqual({ CUSTOM_ENDPOINT: "https://example.test" });
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 100 }),
+    ).resolves.toEqual({ models: [], modes: [] });
+    await expect(client.listImportableSessions()).resolves.toEqual([]);
+    await expect(client.diagnosticRows()).resolves.toContainEqual({
+      label: "ACP initialize",
+      value: "ok (shared)",
+    });
+    expect(client.spawnCount).toBe(1);
+    await session.close();
+  });
+
+  test("applies each caller timeout to a coalesced catalog request", async () => {
+    let resolveNewSession!: (value: { sessionId: string }) => void;
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: {},
+            }),
+            newSession: vi.fn(
+              () =>
+                new Promise<{ sessionId: string }>((resolve) => {
+                  resolveNewSession = resolve;
+                }),
+            ),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    const longRequest = client.fetchCatalog({ scope: "global", force: true, timeoutMs: 100 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 5 }),
+    ).rejects.toThrow("ACP catalog probe timed out after 5ms");
+    resolveNewSession({ sessionId: "session-catalog" });
+    await expect(longRequest).resolves.toEqual({ models: [], modes: [] });
+  });
+
+  test("terminates and replaces a shared host after a catalog timeout", async () => {
+    const terminateProcess: ProcessTerminator = vi.fn(async (child: TreeKillTarget) => {
+      (child as ChildProcess).emit("exit", null, "SIGTERM");
+      return "terminated" as const;
+    });
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        clientFactory?.();
+        const newSession =
+          this.spawnCount === 1
+            ? vi.fn(() => new Promise<never>(() => undefined))
+            : vi.fn().mockResolvedValue({ sessionId: "session-recovered" });
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: {},
+            }),
+            newSession,
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 5 }),
+    ).rejects.toThrow("ACP catalog probe timed out after 5ms");
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 100 }),
+    ).resolves.toEqual({ models: [], modes: [] });
+    expect(client.spawnCount).toBe(2);
+    expect(terminateProcess).toHaveBeenCalledTimes(1);
+  });
+
+  test("bounds shared host initialization with the catalog timeout", async () => {
+    const terminateProcess: ProcessTerminator = vi.fn(async (child: TreeKillTarget) => {
+      (child as ChildProcess).emit("exit", null, "SIGTERM");
+      return "terminated" as const;
+    });
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        clientFactory?.();
+        const initialize =
+          this.spawnCount === 1
+            ? vi.fn(() => new Promise<never>(() => undefined))
+            : vi.fn().mockResolvedValue({
+                protocolVersion: PROTOCOL_VERSION,
+                agentCapabilities: {},
+              });
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize,
+            newSession: vi.fn().mockResolvedValue({ sessionId: "session-recovered" }),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 5 }),
+    ).rejects.toThrow("ACP initialize timed out after 5ms");
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 100 }),
+    ).resolves.toEqual({ models: [], modes: [] });
+    expect(client.spawnCount).toBe(2);
+    expect(terminateProcess).toHaveBeenCalledTimes(1);
+  });
+
+  test("retains a timed-out initializing host until its process exits", async () => {
+    const children: ChildProcessWithoutNullStreams[] = [];
+    const terminateProcess: ProcessTerminator = vi.fn(async () => "kill-timeout" as const);
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        clientFactory?.();
+        const child = createProbeChildStub();
+        children.push(child);
+        return {
+          child,
+          connection: {
+            initialize:
+              this.spawnCount === 1
+                ? vi.fn(() => new Promise<never>(() => undefined))
+                : vi.fn().mockResolvedValue({
+                    protocolVersion: PROTOCOL_VERSION,
+                    agentCapabilities: {},
+                  }),
+            newSession: vi.fn().mockResolvedValue({ sessionId: "session-recovered" }),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    let settled = false;
+    const timedOutCatalog = client
+      .fetchCatalog({ scope: "global", force: true, timeoutMs: 5 })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      )
+      .finally(() => {
+        settled = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(true);
+    expect(await timedOutCatalog).toEqual(
+      expect.objectContaining({ message: "ACP initialize timed out after 5ms" }),
+    );
+    expect(client.spawnCount).toBe(1);
+
+    children[0]?.emit("exit", null, "SIGKILL");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(
+      client.fetchCatalog({ scope: "global", force: true, timeoutMs: 100 }),
+    ).resolves.toEqual({ models: [], modes: [] });
+    expect(client.spawnCount).toBe(2);
+  });
+
+  test("applies the diagnostic phase timeout to shared initialization", async () => {
+    const terminateProcess: ProcessTerminator = vi.fn(async (child: TreeKillTarget) => {
+      (child as ChildProcess).emit("exit", null, "SIGTERM");
+      return "terminated" as const;
+    });
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn(() => new Promise<never>(() => undefined)),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+
+      diagnosticRows() {
+        return this.buildACPProbeDiagnosticRows({ phaseTimeoutMs: 5 });
+      }
+    }
+
+    const rows = await new TestSharedACPAgentClient().diagnosticRows();
+    expect(rows).toContainEqual({
+      label: "ACP shared probe",
+      value: "error: ACP initialize timed out after 5ms",
+    });
+    expect(terminateProcess).toHaveBeenCalledTimes(1);
+  });
+
+  test("bounds a management probe joining an already-initializing host", async () => {
+    const children: ChildProcessWithoutNullStreams[] = [];
+    const terminateProcess: ProcessTerminator = vi.fn(async () => "kill-timeout" as const);
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        clientFactory?.();
+        const child = createProbeChildStub();
+        children.push(child);
+        return {
+          child,
+          connection: {
+            initialize: vi.fn(() => new Promise<never>(() => undefined)),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+
+      diagnosticRows() {
+        return this.buildACPProbeDiagnosticRows({ phaseTimeoutMs: 5 });
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    const initializingCatalog = client
+      .fetchCatalog({ scope: "global", force: true, timeoutMs: 30 })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(client.diagnosticRows()).resolves.toContainEqual({
+      label: "ACP shared probe",
+      value: "error: ACP initialize timed out after 5ms",
+    });
+    expect(client.spawnCount).toBe(1);
+
+    children[0]?.emit("exit", null, "SIGKILL");
+    expect(await initializingCatalog).toEqual(
+      expect.objectContaining({ message: "ACP initialize timed out after 30ms" }),
+    );
+  });
+
+  test("waits for idle shutdown before starting a replacement host", async () => {
+    vi.useFakeTimers();
+    let finishTermination!: () => void;
+    const terminationGate = new Promise<void>((resolve) => {
+      finishTermination = resolve;
+    });
+    const terminateProcess: ProcessTerminator = vi.fn(async (child: TreeKillTarget) => {
+      await terminationGate;
+      (child as ChildProcess).emit("exit", null, "SIGTERM");
+      return "terminated" as const;
+    });
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: {},
+            }),
+            newSession: vi.fn().mockResolvedValue({ sessionId: `session-${this.spawnCount}` }),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    try {
+      const client = new TestSharedACPAgentClient();
+      const first = await client.createSession({ provider: "acp", cwd: "/tmp/first" });
+      await first.close();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      const secondPromise = client.createSession({ provider: "acp", cwd: "/tmp/second" });
+      await Promise.resolve();
+      expect(client.spawnCount).toBe(1);
+
+      finishTermination();
+      const second = await secondPromise;
+      expect(client.spawnCount).toBe(2);
+      await second.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not replace a host until a timed-out process actually exits", async () => {
+    vi.useFakeTimers();
+    const children: ChildProcessWithoutNullStreams[] = [];
+    const terminateProcess: ProcessTerminator = vi.fn(async () => "kill-timeout" as const);
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      spawnCount = 0;
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+          terminateProcess,
+        });
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        this.spawnCount += 1;
+        clientFactory?.();
+        const child = createProbeChildStub();
+        children.push(child);
+        return {
+          child,
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: {},
+            }),
+            newSession: vi.fn().mockResolvedValue({ sessionId: `session-${this.spawnCount}` }),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    try {
+      const client = new TestSharedACPAgentClient();
+      const first = await client.createSession({ provider: "acp", cwd: "/tmp/first" });
+      await first.close();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      const secondPromise = client.createSession({ provider: "acp", cwd: "/tmp/second" });
+      await Promise.resolve();
+      expect(client.spawnCount).toBe(1);
+
+      children[0]?.emit("exit", null, "SIGKILL");
+      const second = await secondPromise;
+      expect(client.spawnCount).toBe(2);
+      await second.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1167,6 +1800,32 @@ describe("ACPAgentSession Zed parity", () => {
     await expect(permission).resolves.toEqual({
       outcome: { outcome: "selected", optionId: "allow-once" },
     });
+  });
+
+  test("cancels pending permissions when the shared process exits", async () => {
+    const session = createSessionWithConfig({ provider: "cursor-acp" });
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+
+    const permission = session.requestPermission({
+      sessionId: "session-1",
+      toolCall: {
+        toolCallId: "tool-crash",
+        title: "Edit file",
+        kind: "edit",
+        status: "pending",
+      },
+      options: [{ optionId: "allow-once", name: "Allow", kind: "allow_once" }],
+    } satisfies RequestPermissionRequest);
+    await Promise.resolve();
+    const [pending] = session.getPendingPermissions();
+    expect(pending).toBeDefined();
+
+    session.handleSharedProcessExit(null, "SIGKILL", "crashed");
+    await expect(permission).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    expect(session.getPendingPermissions()).toEqual([]);
+    await expect(session.respondToPermission(pending!.id, { behavior: "allow" })).rejects.toThrow(
+      "No pending permission request",
+    );
   });
 
   test("preserves ACP chooser actions and returns the selected option", async () => {

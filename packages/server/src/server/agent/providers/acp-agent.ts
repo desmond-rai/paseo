@@ -140,6 +140,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
+function createSharedACPLaunchEnv(
+  launchEnv?: Record<string, string>,
+): Record<string, string> | undefined {
+  if (!launchEnv) {
+    return undefined;
+  }
+  const sharedEntries = Object.entries(launchEnv).filter(
+    ([key]) =>
+      key !== "PASEO_AGENT_ID" && key !== "PASEO_AGENT_CWD" && key !== "PASEO_WORKSPACE_ID",
+  );
+  return sharedEntries.length > 0 ? Object.fromEntries(sharedEntries) : undefined;
+}
+
+function stableEnvKey(env?: Record<string, string>): string {
+  return JSON.stringify(
+    Object.entries(env ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
 function isACPError(value: unknown): value is ACPError {
   return isRecord(value) && typeof value.message === "string" && typeof value.code === "number";
 }
@@ -272,7 +291,10 @@ export function buildACPClientCapabilities(
 // sign-in URL in the browser) when probing an ACP agent for models/modes.
 // NO_BROWSER is honored by Gemini CLI; other ACP agents ignore it.
 const PROBE_ENV: Record<string, string> = { NO_BROWSER: "true" };
+const ACP_CATALOG_TIMEOUT_MS = 60_000;
 const ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS = 20_000;
+
+type ACPFetchCatalogOptions = FetchCatalogOptions & { timeoutMs?: number };
 
 function summarizeMalformedACPStdoutError(error: unknown): { type: string; message: string } {
   return {
@@ -435,6 +457,7 @@ interface ACPAgentClientOptions {
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
+  shareProcess?: boolean;
 }
 
 interface ACPAgentSessionOptions {
@@ -468,6 +491,31 @@ interface ACPAgentSessionOptions {
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
+  sharedProcess?: ACPSharedProcessLease;
+}
+
+interface ACPSharedRouteTarget extends Pick<
+  ACPAgentSession,
+  | "requestPermission"
+  | "sessionUpdate"
+  | "readTextFile"
+  | "writeTextFile"
+  | "createTerminal"
+  | "terminalOutput"
+  | "waitForTerminalExit"
+  | "releaseTerminal"
+  | "killTerminal"
+  | "extNotification"
+> {
+  handleSharedProcessExit?: ACPAgentSession["handleSharedProcessExit"];
+}
+
+interface ACPSharedProcessLease {
+  connection: ClientSideConnection;
+  initialize: InitializeResponse;
+  register(sessionId: string, client: ACPSharedRouteTarget): void;
+  release(sessionId: string | null): void;
+  invalidate(reason: Error): Promise<void>;
 }
 
 export interface SpawnedACPProcess {
@@ -481,7 +529,7 @@ type UninitializedACPProcess = Omit<SpawnedACPProcess, "initialize"> & {
   initialize?: InitializeResponse;
 };
 
-interface ACPProcessTransport {
+export interface ACPProcessTransport {
   child: ChildProcessWithoutNullStreams;
   connection: ClientSideConnection;
   stderrChunks: string[];
@@ -823,6 +871,12 @@ export class ACPAgentClient implements AgentClient {
   private readonly initialCommandsWaitTimeoutMs: number;
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   protected readonly terminateProcess: ProcessTerminator;
+  private readonly shareProcess: boolean;
+  private sharedProcessHost: Promise<ACPSharedProcessHost> | null = null;
+  private sharedProcessLaunchEnvKey: string | null = null;
+  private sharedProcessInitializationAbort: (() => Promise<void>) | null = null;
+  private sharedCatalog: ProviderCatalog | null = null;
+  private sharedCatalogRequest: Promise<ProviderCatalog> | null = null;
 
   constructor(options: ACPAgentClientOptions) {
     this.provider = options.provider;
@@ -850,6 +904,7 @@ export class ACPAgentClient implements AgentClient {
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
+    this.shareProcess = options.shareProcess ?? false;
   }
 
   async createSession(
@@ -857,6 +912,9 @@ export class ACPAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
     this.assertProvider(config);
+    const sharedProcess = this.shareProcess
+      ? await this.acquireSharedProcess(launchContext?.env)
+      : undefined;
     const session = new ACPAgentSession(
       { ...config, provider: this.provider },
       {
@@ -882,6 +940,7 @@ export class ACPAgentClient implements AgentClient {
         extensionCommandsParser: this.extensionCommandsParser,
         waitForInitialCommands: this.waitForInitialCommands,
         initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+        sharedProcess,
       },
     );
     await session.initializeNewSession();
@@ -909,6 +968,9 @@ export class ACPAgentClient implements AgentClient {
       provider: this.provider,
       cwd,
     };
+    const sharedProcess = this.shareProcess
+      ? await this.acquireSharedProcess(launchContext?.env)
+      : undefined;
     const session = new ACPAgentSession(mergedConfig, {
       provider: this.provider,
       logger: this.logger,
@@ -933,15 +995,49 @@ export class ACPAgentClient implements AgentClient {
       extensionCommandsParser: this.extensionCommandsParser,
       waitForInitialCommands: this.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+      sharedProcess,
     });
     await session.initializeResumedSession();
     return session;
   }
 
   async fetchCatalog(
-    options: FetchCatalogOptions,
+    options: ACPFetchCatalogOptions,
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
+    if (this.shareProcess) {
+      if (!options.force && this.sharedCatalog) {
+        return this.sharedCatalog;
+      }
+      if (this.sharedCatalogRequest) {
+        const timeoutMs = options.timeoutMs ?? ACP_CATALOG_TIMEOUT_MS;
+        return runProviderRefreshActivity(context, "shared-catalog", () =>
+          raceProviderRefreshAbort(
+            context?.signal,
+            withTimeout(
+              this.sharedCatalogRequest!,
+              timeoutMs,
+              `ACP catalog probe timed out after ${timeoutMs}ms`,
+            ),
+          ),
+        );
+      }
+      const request = this.fetchCatalogFromSharedProcess(options).then((catalog) => {
+        this.sharedCatalog = catalog;
+        return catalog;
+      });
+      this.sharedCatalogRequest = request;
+      try {
+        return await runProviderRefreshActivity(context, "shared-catalog", () =>
+          raceProviderRefreshAbort(context?.signal, request),
+        );
+      } finally {
+        if (this.sharedCatalogRequest === request) {
+          this.sharedCatalogRequest = null;
+        }
+      }
+    }
+
     const cwd = options.scope === "global" ? homedir() : options.cwd;
     let probe: UninitializedACPProcess | null = null;
     let closePromise: Promise<void> | null = null;
@@ -1018,6 +1114,95 @@ export class ACPAgentClient implements AgentClient {
     }
   }
 
+  private async fetchCatalogFromSharedProcess(
+    options: ACPFetchCatalogOptions,
+  ): Promise<ProviderCatalog> {
+    const startedAt = Date.now();
+    const cwd = options.scope === "global" ? homedir() : options.cwd;
+    const timeoutMs = options.timeoutMs ?? ACP_CATALOG_TIMEOUT_MS;
+    const sharedProcess = await this.acquireSharedProcess(undefined, timeoutMs, true);
+    const remainingTimeoutMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+    let requestSettled = false;
+    const request = (async () => {
+      let sessionId: string | null = null;
+      const unsupported = async (): Promise<never> => {
+        throw new Error("ACP catalog probe does not support client callbacks");
+      };
+      const routeTarget: ACPSharedRouteTarget = {
+        requestPermission: unsupported,
+        sessionUpdate: async () => {},
+        readTextFile: unsupported,
+        writeTextFile: unsupported,
+        createTerminal: unsupported,
+        terminalOutput: unsupported,
+        waitForTerminalExit: unsupported,
+        releaseTerminal: unsupported,
+        killTerminal: unsupported,
+        extNotification: async () => {},
+      };
+
+      try {
+        const response = await this.runACPRequest(() =>
+          sharedProcess.connection.newSession({ cwd, mcpServers: [] }),
+        );
+        const createdSessionId = response.sessionId;
+        sessionId = createdSessionId;
+        sharedProcess.register(createdSessionId, routeTarget);
+        const transformed = this.transformSessionResponse(response);
+        const derivedModels = deriveModelDefinitionsFromACP(
+          this.provider,
+          transformed.models,
+          transformed.configOptions,
+        );
+        const models = this.catalogModelResolver
+          ? await this.catalogModelResolver({
+              connection: sharedProcess.connection,
+              sessionId: createdSessionId,
+              models: derivedModels,
+              configOptions: transformed.configOptions,
+              runRequest: (catalogRequest) => this.runACPRequest(catalogRequest),
+              transformConfigOptions: (configOptions) =>
+                this.configOptionsTransformer
+                  ? this.configOptionsTransformer(configOptions)
+                  : configOptions,
+              logger: this.logger,
+              provider: this.provider,
+            })
+          : derivedModels;
+        const modeInfo = deriveModesFromACP(
+          this.defaultModes,
+          transformed.modes,
+          transformed.configOptions,
+        );
+        return {
+          models: this.modelTransformer ? this.modelTransformer(models) : models,
+          modes: modeInfo.modes,
+        };
+      } finally {
+        if (sessionId && sharedProcess.initialize.agentCapabilities?.sessionCapabilities?.close) {
+          try {
+            await sharedProcess.connection.unstable_closeSession({ sessionId });
+          } catch (error) {
+            this.logger.debug({ err: error }, "ACP shared catalog session close failed");
+          }
+        }
+        sharedProcess.release(sessionId);
+      }
+    })().finally(() => {
+      requestSettled = true;
+    });
+
+    const timeoutMessage = `ACP catalog probe timed out after ${timeoutMs}ms`;
+    try {
+      return await withTimeout(request, remainingTimeoutMs, timeoutMessage);
+    } catch (error) {
+      if (!requestSettled) {
+        await sharedProcess.invalidate(new Error(timeoutMessage));
+      }
+      throw error;
+    }
+  }
+
   async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
     const autoAcceptFeature = buildACPAutoAcceptFeature(config);
     if (this.configFeatureOptions.length === 0) {
@@ -1046,7 +1231,7 @@ export class ACPAgentClient implements AgentClient {
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
-    const probe = await this.spawnProcess(PROBE_ENV);
+    const probe = await this.acquireSessionListingConnection();
     try {
       if (!probe.initialize.agentCapabilities?.sessionCapabilities?.list) {
         return [];
@@ -1081,8 +1266,33 @@ export class ACPAgentClient implements AgentClient {
 
       return typeof options?.limit === "number" ? sessions.slice(0, options.limit) : sessions;
     } finally {
-      await this.closeProbe(probe);
+      await probe.release();
     }
+  }
+
+  private async acquireSessionListingConnection(): Promise<{
+    connection: ClientSideConnection;
+    initialize: InitializeResponse;
+    release: () => Promise<void>;
+  }> {
+    if (this.shareProcess) {
+      const sharedProcess = await this.acquireSharedProcess(
+        undefined,
+        ACP_CATALOG_TIMEOUT_MS,
+        true,
+      );
+      return {
+        connection: sharedProcess.connection,
+        initialize: sharedProcess.initialize,
+        release: async () => sharedProcess.release(null),
+      };
+    }
+    const probe = await this.spawnProcess(PROBE_ENV);
+    return {
+      connection: probe.connection,
+      initialize: probe.initialize,
+      release: async () => this.closeProbe(probe),
+    };
   }
 
   async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
@@ -1131,7 +1341,10 @@ export class ACPAgentClient implements AgentClient {
     }
   }
 
-  protected async spawnTransport(launchEnv?: Record<string, string>): Promise<ACPProcessTransport> {
+  protected async spawnTransport(
+    launchEnv?: Record<string, string>,
+    clientFactory: () => ACPClient = () => this.buildProbeClient(),
+  ): Promise<ACPProcessTransport> {
     const { command, args } = await this.resolveLaunchCommand();
     const child = spawnProcess(command, args, {
       cwd: process.cwd(),
@@ -1165,7 +1378,7 @@ export class ACPAgentClient implements AgentClient {
       Readable.toWeb(child.stdout),
       { logger: this.logger, provider: this.provider },
     );
-    const connection = new ClientSideConnection(() => this.buildProbeClient(), stream);
+    const connection = new ClientSideConnection(clientFactory, stream);
 
     return {
       child,
@@ -1207,6 +1420,120 @@ export class ACPAgentClient implements AgentClient {
     } finally {
       if (timeout) {
         clearTimeout(timeout);
+      }
+    }
+  }
+
+  private async acquireSharedProcess(
+    launchEnv?: Record<string, string>,
+    initializeTimeoutMs = ACP_CATALOG_TIMEOUT_MS,
+    reuseActiveLaunchEnvironment = false,
+  ): Promise<ACPSharedProcessLease> {
+    const sharedLaunchEnv = createSharedACPLaunchEnv(launchEnv);
+    const requestedLaunchEnvKey = stableEnvKey(sharedLaunchEnv);
+    for (;;) {
+      const launchEnvKey =
+        reuseActiveLaunchEnvironment && this.sharedProcessHost && this.sharedProcessLaunchEnvKey
+          ? this.sharedProcessLaunchEnvKey
+          : requestedLaunchEnvKey;
+      if (this.sharedProcessHost && this.sharedProcessLaunchEnvKey !== launchEnvKey) {
+        const existingHost = await this.awaitSharedProcessHost(
+          this.sharedProcessHost,
+          initializeTimeoutMs,
+        );
+        if (existingHost.isStopped()) {
+          await existingHost.whenStopped();
+          continue;
+        }
+        if (!existingHost.hasReferences()) {
+          await existingHost.retire();
+          continue;
+        }
+        throw new Error(
+          "Shared ACP sessions require the same launch environment; refusing to reuse a process with different environment values",
+        );
+      }
+      if (!this.sharedProcessHost) {
+        let hostPromise: Promise<ACPSharedProcessHost>;
+        hostPromise = this.createSharedProcessHost(sharedLaunchEnv, initializeTimeoutMs, () => {
+          if (this.sharedProcessHost === hostPromise) {
+            this.sharedProcessHost = null;
+            this.sharedProcessLaunchEnvKey = null;
+          }
+        });
+        this.sharedProcessHost = hostPromise;
+        this.sharedProcessLaunchEnvKey = launchEnvKey;
+        void hostPromise.catch(() => {
+          if (this.sharedProcessHost === hostPromise) {
+            this.sharedProcessHost = null;
+            this.sharedProcessLaunchEnvKey = null;
+          }
+        });
+      }
+      const host = await this.awaitSharedProcessHost(this.sharedProcessHost, initializeTimeoutMs);
+      if (host.isStopped()) {
+        await host.whenStopped();
+        continue;
+      }
+      return host.acquire();
+    }
+  }
+
+  private async awaitSharedProcessHost(
+    hostPromise: Promise<ACPSharedProcessHost>,
+    timeoutMs: number,
+  ): Promise<ACPSharedProcessHost> {
+    try {
+      return await withTimeout(
+        hostPromise,
+        timeoutMs,
+        `ACP initialize timed out after ${timeoutMs}ms`,
+      );
+    } catch (error) {
+      if (this.sharedProcessHost === hostPromise && this.sharedProcessInitializationAbort) {
+        const abort = this.sharedProcessInitializationAbort;
+        void abort().then(() => {
+          if (this.sharedProcessHost === hostPromise) {
+            this.sharedProcessHost = null;
+            this.sharedProcessLaunchEnvKey = null;
+          }
+          return undefined;
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async createSharedProcessHost(
+    launchEnv?: Record<string, string>,
+    initializeTimeoutMs = ACP_CATALOG_TIMEOUT_MS,
+    onStopped: () => void = () => {},
+  ): Promise<ACPSharedProcessHost> {
+    const router = new ACPSharedClientRouter();
+    const transport = await this.spawnTransport(launchEnv, () => router);
+    let cleanupPromise: Promise<void> | null = null;
+    const abortInitialization = (): Promise<void> => {
+      cleanupPromise ??= terminateChildProcess(transport.child, 2_000, this.terminateProcess, true);
+      return cleanupPromise;
+    };
+    this.sharedProcessInitializationAbort = abortInitialization;
+    try {
+      const initialize = await this.initializeTransport(transport, initializeTimeoutMs);
+      return new ACPSharedProcessHost({
+        child: transport.child,
+        connection: transport.connection,
+        initialize,
+        stderrChunks: transport.stderrChunks,
+        router,
+        terminateProcess: this.terminateProcess,
+        onStopped,
+      });
+    } catch (error) {
+      await abortInitialization();
+      throw error;
+    } finally {
+      if (this.sharedProcessInitializationAbort === abortInitialization) {
+        this.sharedProcessInitializationAbort = null;
       }
     }
   }
@@ -1256,6 +1583,10 @@ export class ACPAgentClient implements AgentClient {
       phaseTimeoutMs?: number;
     } = {},
   ): Promise<DiagnosticEntry[]> {
+    if (this.shareProcess) {
+      return this.buildSharedACPProbeDiagnosticRows(options);
+    }
+
     const rows: DiagnosticEntry[] = [];
     const phaseTimeoutMs = options.phaseTimeoutMs ?? ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS;
     const cwd = options.cwd ?? homedir();
@@ -1358,6 +1689,49 @@ export class ACPAgentClient implements AgentClient {
     }
   }
 
+  private async buildSharedACPProbeDiagnosticRows(
+    options: {
+      cwd?: string;
+      phaseTimeoutMs?: number;
+    } = {},
+  ): Promise<DiagnosticEntry[]> {
+    const rows: DiagnosticEntry[] = [];
+    const startedAt = Date.now();
+    let sharedProcess: ACPSharedProcessLease | null = null;
+    try {
+      sharedProcess = await this.acquireSharedProcess(
+        undefined,
+        options.phaseTimeoutMs ?? ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS,
+        true,
+      );
+      rows.push(
+        { label: "ACP spawn", value: `ok (${formatDurationMs(startedAt)}; shared)` },
+        { label: "ACP initialize", value: "ok (shared)" },
+      );
+      const catalogStartedAt = Date.now();
+      const catalog = await this.fetchCatalogFromSharedProcess({
+        scope: "workspace",
+        cwd: options.cwd ?? homedir(),
+        force: true,
+        timeoutMs: options.phaseTimeoutMs ?? ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS,
+      });
+      rows.push({
+        label: "ACP session/new",
+        value: `ok (${formatDurationMs(catalogStartedAt)}; models=${catalog.models.length}; modes=${catalog.modes.length}; shared)`,
+      });
+      return rows;
+    } catch (error) {
+      rows.push({
+        label: "ACP shared probe",
+        value: `error: ${toDiagnosticErrorMessage(error)}`,
+      });
+      return rows;
+    } finally {
+      sharedProcess?.release(null);
+      rows.push({ label: "ACP cleanup", value: "ok (shared lease released)" });
+    }
+  }
+
   protected async resolveLaunchCommand(): Promise<{ command: string; args: string[] }> {
     const prefix = await resolveProviderLaunch({
       commandConfig: this.runtimeSettings?.command,
@@ -1434,6 +1808,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly terminalEntries = new Map<string, TerminalEntry>();
   private readonly persistedHistory: AgentTimelineItem[] = [];
   private readonly initialHandle?: AgentPersistenceHandle;
+  private readonly sharedProcess?: ACPSharedProcessLease;
 
   private readonly config: AgentSessionConfig;
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -1486,6 +1861,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.agentId = options.agentId;
     this.launchEnv = options.launchEnv;
     this.initialHandle = options.handle;
+    this.sharedProcess = options.sharedProcess;
     this.config = { ...config, provider: options.provider };
     this.currentMode = config.modeId ?? null;
     this.currentModel = config.model ?? null;
@@ -1502,10 +1878,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   async initializeNewSession(): Promise<void> {
     try {
-      const spawned = await this.spawnProcess();
-      this.child = spawned.child;
-      this.connection = spawned.connection;
-      this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+      await this.attachProcess();
 
       const response = await this.runACPRequest(() =>
         this.connection!.newSession({
@@ -1514,6 +1887,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         }),
       );
       this.sessionId = response.sessionId;
+      this.sharedProcess?.register(response.sessionId, this);
       this.bootstrapThreadEventPending = true;
       this.applySessionState(response);
       await this.applyConfiguredOverrides();
@@ -1536,11 +1910,9 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         throw new Error("Resume requested without persistence handle");
       }
 
-      const spawned = await this.spawnProcess();
-      this.child = spawned.child;
-      this.connection = spawned.connection;
-      this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
+      await this.attachProcess();
       this.sessionId = handle.sessionId;
+      this.sharedProcess?.register(handle.sessionId, this);
       this.bootstrapThreadEventPending = true;
 
       const sessionCapabilities = this.agentCapabilities?.sessionCapabilities;
@@ -1586,6 +1958,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       );
     }
     throw error;
+  }
+
+  private async attachProcess(): Promise<void> {
+    if (this.sharedProcess) {
+      this.connection = this.sharedProcess.connection;
+      this.agentCapabilities = this.sharedProcess.initialize.agentCapabilities ?? null;
+      return;
+    }
+    const spawned = await this.spawnProcess();
+    this.child = spawned.child;
+    this.connection = spawned.connection;
+    this.agentCapabilities = spawned.initialize.agentCapabilities ?? null;
   }
 
   async run(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<AgentRunResult> {
@@ -2223,11 +2607,37 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (this.child) {
       await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
     }
+    this.sharedProcess?.release(this.sessionId);
 
     this.subscribers.clear();
     this.connection = null;
     this.child = null;
     this.activeForegroundTurnId = null;
+  }
+
+  handleSharedProcessExit(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    diagnostic?: string,
+  ): void {
+    if (this.closed) {
+      return;
+    }
+    this.connection = null;
+    for (const pending of this.pendingPermissions.values()) {
+      pending.resolve({ outcome: { outcome: "cancelled" } });
+    }
+    this.pendingPermissions.clear();
+    if (this.activeForegroundTurnId) {
+      this.synthesizeCanceledToolCalls();
+      this.finishTurn({
+        type: "turn_failed",
+        provider: this.provider,
+        error: `Shared ACP agent exited unexpectedly (${code ?? "null"}${signal ? `, ${signal}` : ""})`,
+        diagnostic: diagnostic || undefined,
+        turnId: this.activeForegroundTurnId,
+      });
+    }
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -2996,6 +3406,237 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 }
 
+class ACPSharedClientRouter implements ACPClient {
+  private readonly sessions = new Map<string, ACPSharedRouteTarget>();
+
+  register(sessionId: string, client: ACPSharedRouteTarget): void {
+    this.sessions.set(sessionId, client);
+  }
+
+  unregister(sessionId: string | null): void {
+    if (sessionId) {
+      this.sessions.delete(sessionId);
+    }
+  }
+
+  notifyProcessExit(code: number | null, signal: NodeJS.Signals | null, diagnostic?: string): void {
+    for (const session of this.sessions.values()) {
+      session.handleSharedProcessExit?.(code, signal, diagnostic);
+    }
+    this.sessions.clear();
+  }
+
+  async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    return this.session(params.sessionId).requestPermission(params);
+  }
+
+  async sessionUpdate(params: SessionNotification): Promise<void> {
+    return this.session(params.sessionId).sessionUpdate(params);
+  }
+
+  async readTextFile(params: ReadTextFileRequest): Promise<{ content: string }> {
+    return this.session(params.sessionId).readTextFile(params);
+  }
+
+  async writeTextFile(params: WriteTextFileRequest): Promise<Record<string, never>> {
+    return this.session(params.sessionId).writeTextFile(params);
+  }
+
+  async createTerminal(params: CreateTerminalRequest): Promise<{ terminalId: string }> {
+    return this.session(params.sessionId).createTerminal(params);
+  }
+
+  async terminalOutput(params: TerminalOutputRequest): Promise<TerminalOutputResponse> {
+    return this.session(params.sessionId).terminalOutput(params);
+  }
+
+  async waitForTerminalExit(params: WaitForTerminalExitRequest): Promise<TerminalExit> {
+    return this.session(params.sessionId).waitForTerminalExit(params);
+  }
+
+  async releaseTerminal(params: { sessionId: string; terminalId: string }): Promise<void> {
+    return this.session(params.sessionId).releaseTerminal(params);
+  }
+
+  async killTerminal(params: KillTerminalRequest): Promise<Record<string, never>> {
+    return this.session(params.sessionId).killTerminal(params);
+  }
+
+  async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+    const sessionId = typeof params.sessionId === "string" ? params.sessionId : null;
+    if (sessionId) {
+      await this.session(sessionId).extNotification(method, params);
+      return;
+    }
+    await Promise.all(
+      Array.from(this.sessions.values(), (session) => session.extNotification(method, params)),
+    );
+  }
+
+  private session(sessionId: string): ACPSharedRouteTarget {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`ACP shared process sent a request for unknown session '${sessionId}'`);
+    }
+    return session;
+  }
+}
+
+class ACPSharedProcessHost {
+  private readonly child: ChildProcessWithoutNullStreams;
+  private readonly connection: ClientSideConnection;
+  private readonly initialize: InitializeResponse;
+  private readonly stderrChunks: string[];
+  private readonly router: ACPSharedClientRouter;
+  private readonly terminateProcess: ProcessTerminator;
+  private readonly onStopped: () => void;
+  private readonly stoppedPromise: Promise<void>;
+  private resolveStopped!: () => void;
+  private references = 0;
+  private stopTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = false;
+  private stopFinalized = false;
+
+  constructor(options: {
+    child: ChildProcessWithoutNullStreams;
+    connection: ClientSideConnection;
+    initialize: InitializeResponse;
+    stderrChunks: string[];
+    router: ACPSharedClientRouter;
+    terminateProcess: ProcessTerminator;
+    onStopped: () => void;
+  }) {
+    this.child = options.child;
+    this.connection = options.connection;
+    this.initialize = options.initialize;
+    this.stderrChunks = options.stderrChunks;
+    this.router = options.router;
+    this.terminateProcess = options.terminateProcess;
+    this.onStopped = options.onStopped;
+    this.stoppedPromise = new Promise<void>((resolve) => {
+      this.resolveStopped = resolve;
+    });
+    this.child.once("exit", (code, signal) => {
+      this.handleExit(code, signal);
+    });
+  }
+
+  isStopped(): boolean {
+    return this.stopped;
+  }
+
+  hasReferences(): boolean {
+    return this.references > 0;
+  }
+
+  whenStopped(): Promise<void> {
+    return this.stoppedPromise;
+  }
+
+  retire(): Promise<void> {
+    return this.stop();
+  }
+
+  acquire(): ACPSharedProcessLease {
+    if (this.stopped) {
+      throw new Error("ACP shared process is no longer available");
+    }
+    this.references += 1;
+    if (this.stopTimer) {
+      clearTimeout(this.stopTimer);
+      this.stopTimer = null;
+    }
+    let released = false;
+    return {
+      connection: this.connection,
+      initialize: this.initialize,
+      register: (sessionId, client) => {
+        this.router.register(sessionId, client);
+      },
+      invalidate: (reason) => this.invalidate(reason),
+      release: (sessionId) => {
+        if (released) {
+          return;
+        }
+        released = true;
+        this.router.unregister(sessionId);
+        this.references = Math.max(0, this.references - 1);
+        if (this.references === 0) {
+          this.scheduleStop();
+        }
+      },
+    };
+  }
+
+  private scheduleStop(): void {
+    this.stopTimer = setTimeout(() => {
+      this.stopTimer = null;
+      void this.stop();
+    }, 1_000);
+    this.stopTimer.unref?.();
+  }
+
+  private async stop(): Promise<void> {
+    if (this.stopped || this.references > 0) {
+      return;
+    }
+    this.stopped = true;
+    await this.terminateAndFinalizeWhenExited();
+  }
+
+  private async invalidate(reason: Error): Promise<void> {
+    if (this.stopped) {
+      return this.stoppedPromise;
+    }
+    this.stopped = true;
+    if (this.stopTimer) {
+      clearTimeout(this.stopTimer);
+      this.stopTimer = null;
+    }
+    this.router.notifyProcessExit(null, null, reason.message);
+    await this.terminateAndFinalizeWhenExited();
+  }
+
+  private async terminateAndFinalizeWhenExited(): Promise<void> {
+    try {
+      const result = await this.terminateProcess(this.child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+      });
+      if (result !== "kill-timeout") {
+        this.finalizeStop();
+      }
+    } catch {
+      if (typeof this.child.exitCode === "number" || this.child.signalCode != null) {
+        this.finalizeStop();
+      }
+    }
+  }
+
+  private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.stopped) {
+      this.finalizeStop();
+      return;
+    }
+    this.stopped = true;
+    if (this.stopTimer) {
+      clearTimeout(this.stopTimer);
+      this.stopTimer = null;
+    }
+    this.router.notifyProcessExit(code, signal, this.stderrChunks.join("").trim() || undefined);
+    this.finalizeStop();
+  }
+
+  private finalizeStop(): void {
+    if (this.stopFinalized) {
+      return;
+    }
+    this.stopFinalized = true;
+    this.onStopped();
+    this.resolveStopped();
+  }
+}
+
 export function findSelectConfigOption({
   configOptions,
   category,
@@ -3674,12 +4315,36 @@ async function terminateChildProcess(
   child: ChildProcessWithoutNullStreams,
   timeoutMs: number,
   terminate: ProcessTerminator,
+  waitForExitOnTimeout = false,
 ): Promise<void> {
+  const exited = waitForExitOnTimeout
+    ? new Promise<void>((resolve) => {
+        child.once("exit", () => resolve());
+      })
+    : null;
+  let result: Awaited<ReturnType<ProcessTerminator>> | null = null;
+  let terminationError: unknown;
   try {
-    await terminate(child, { gracefulTimeoutMs: timeoutMs, forceTimeoutMs: timeoutMs });
+    result = await terminate(child, {
+      gracefulTimeoutMs: timeoutMs,
+      forceTimeoutMs: timeoutMs,
+    });
+  } catch (error) {
+    terminationError = error;
   } finally {
     child.stdin.destroy();
     child.stdout.destroy();
     child.stderr.destroy();
+  }
+  if (
+    waitForExitOnTimeout &&
+    (result === "kill-timeout" || terminationError !== undefined) &&
+    typeof child.exitCode !== "number" &&
+    child.signalCode == null
+  ) {
+    await exited;
+  }
+  if (terminationError !== undefined && !waitForExitOnTimeout) {
+    throw terminationError;
   }
 }

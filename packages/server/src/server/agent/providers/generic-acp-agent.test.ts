@@ -41,7 +41,7 @@ describe("GenericACPAgentClient", () => {
     });
     void _client;
 
-    expect(mockState.superConstructorOptions).toEqual([
+    expect(mockState.superConstructorOptions).toMatchObject([
       {
         provider: "acp",
         logger: expect.any(Object),
@@ -62,8 +62,27 @@ describe("GenericACPAgentClient", () => {
           supportsRewindFiles: false,
           supportsRewindBoth: false,
         },
+        shareProcess: false,
       },
     ]);
+  });
+
+  test("shares the ACP process only for the built-in Hermes provider", () => {
+    const hermesClient = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["hermes", "acp"],
+      providerId: "hermes",
+    });
+    const otherClient = new GenericACPAgentClient({
+      logger: createTestLogger(),
+      command: ["other-acp"],
+      providerId: "other",
+    });
+    void hermesClient;
+    void otherClient;
+
+    expect(mockState.superConstructorOptions.at(-2)).toMatchObject({ shareProcess: true });
+    expect(mockState.superConstructorOptions.at(-1)).toMatchObject({ shareProcess: false });
   });
 
   test("uses provider params to report MCP support", () => {

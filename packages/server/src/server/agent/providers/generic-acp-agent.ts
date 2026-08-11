@@ -76,6 +76,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
       configFeatureOptions: options.configFeatureOptions,
       extensionCommandsParser: options.extensionCommandsParser,
       catalogModelResolver: options.catalogModelResolver,
+      shareProcess: options.providerId === "hermes",
     });
 
     this.command = options.command;
