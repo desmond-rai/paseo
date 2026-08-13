@@ -190,6 +190,83 @@ describe("ACPAgentClient shared process", () => {
     await Promise.all(sessions.map((session) => session.close()));
   });
 
+  test("delivers session updates that arrive before session registration", async () => {
+    let router: ACPClient | undefined;
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      readonly newSession = vi.fn(async () => {
+        const sessionId = `session-${this.newSession.mock.calls.length}`;
+        // Simulate an agent that pushes its slash-command batch immediately
+        // after the session/new response, before the client continuation has
+        // registered the session with the shared router.
+        if (router?.sessionUpdate) {
+          try {
+            await router.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "available_commands_update",
+                availableCommands: [
+                  {
+                    name: "what-did-you-learn",
+                    description: "Run an evidence-based retrospective",
+                  },
+                ],
+              } as SessionUpdate,
+            });
+          } catch {
+            // The ACP SDK logs and swallows notification handler errors;
+            // this mirrors that delivery boundary.
+          }
+        }
+        return { sessionId };
+      });
+
+      constructor() {
+        super({
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"],
+          shareProcess: true,
+        });
+      }
+
+      protected override async spawnTransport(
+        launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        router = clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: {},
+            }),
+            newSession: this.newSession,
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    const client = new TestSharedACPAgentClient();
+    const session = await client.createSession(
+      { provider: "acp", cwd: "/tmp/worktree-1" },
+      { agentId: "agent-1" },
+    );
+
+    expect(await session.listCommands?.()).toEqual([
+      {
+        name: "what-did-you-learn",
+        description: "Run an evidence-based retrospective",
+        argumentHint: "",
+        kind: "command",
+      },
+    ]);
+    await session.close();
+  });
+
   test("preserves caller launch variables while removing agent-scoped values", async () => {
     class TestSharedACPAgentClient extends ACPAgentClient {
       launchEnv: Record<string, string> | undefined;

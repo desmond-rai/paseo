@@ -292,6 +292,7 @@ export function buildACPClientCapabilities(
 // NO_BROWSER is honored by Gemini CLI; other ACP agents ignore it.
 const PROBE_ENV: Record<string, string> = { NO_BROWSER: "true" };
 const ACP_CATALOG_TIMEOUT_MS = 60_000;
+const MAX_PENDING_SESSION_UPDATES_PER_SESSION = 100;
 const ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS = 20_000;
 
 type ACPFetchCatalogOptions = FetchCatalogOptions & { timeoutMs?: number };
@@ -3413,14 +3414,23 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
 class ACPSharedClientRouter implements ACPClient {
   private readonly sessions = new Map<string, ACPSharedRouteTarget>();
+  private readonly pendingSessionUpdates = new Map<string, SessionNotification[]>();
 
   register(sessionId: string, client: ACPSharedRouteTarget): void {
     this.sessions.set(sessionId, client);
+    const pending = this.pendingSessionUpdates.get(sessionId);
+    if (pending) {
+      this.pendingSessionUpdates.delete(sessionId);
+      for (const params of pending) {
+        void client.sessionUpdate(params);
+      }
+    }
   }
 
   unregister(sessionId: string | null): void {
     if (sessionId) {
       this.sessions.delete(sessionId);
+      this.pendingSessionUpdates.delete(sessionId);
     }
   }
 
@@ -3429,6 +3439,7 @@ class ACPSharedClientRouter implements ACPClient {
       session.handleSharedProcessExit?.(code, signal, diagnostic);
     }
     this.sessions.clear();
+    this.pendingSessionUpdates.clear();
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -3436,7 +3447,21 @@ class ACPSharedClientRouter implements ACPClient {
   }
 
   async sessionUpdate(params: SessionNotification): Promise<void> {
-    return this.session(params.sessionId).sessionUpdate(params);
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      // Agents may push session-scoped notifications (for example
+      // `available_commands_update`) immediately after the session/new
+      // response, before the client has registered the session with this
+      // router. Buffer them instead of dropping; register() replays them in
+      // arrival order once the session is known.
+      const pending = this.pendingSessionUpdates.get(params.sessionId) ?? [];
+      if (pending.length < MAX_PENDING_SESSION_UPDATES_PER_SESSION) {
+        pending.push(params);
+        this.pendingSessionUpdates.set(params.sessionId, pending);
+      }
+      return;
+    }
+    return session.sessionUpdate(params);
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<{ content: string }> {
