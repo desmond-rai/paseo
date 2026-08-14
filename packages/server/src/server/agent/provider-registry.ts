@@ -108,11 +108,12 @@ export interface BuildProviderRegistryOptions {
   managedProcesses?: ManagedProcessRegistry;
   isDev?: boolean;
   ompRuntime?: OmpRuntime;
+  hermesSharedProcessScope?: object;
 }
 
 interface ProviderClientFactoryOptions extends Pick<
   BuildProviderRegistryOptions,
-  "workspaceGitService" | "managedProcesses" | "ompRuntime"
+  "workspaceGitService" | "managedProcesses" | "ompRuntime" | "hermesSharedProcessScope"
 > {
   providerParams?: unknown;
   customProvider?: {
@@ -700,7 +701,7 @@ function buildResolvedBuiltinProviders(
   runtimeSettings: AgentProviderRuntimeSettingsMap | undefined,
   options: Pick<
     BuildProviderRegistryOptions,
-    "workspaceGitService" | "managedProcesses" | "ompRuntime"
+    "workspaceGitService" | "managedProcesses" | "ompRuntime" | "hermesSharedProcessScope"
   >,
   isDev: boolean,
 ): Map<string, ResolvedProvider> {
@@ -732,6 +733,7 @@ function buildResolvedBuiltinProviders(
           workspaceGitService: options.workspaceGitService,
           managedProcesses: options.managedProcesses,
           ompRuntime: options.ompRuntime,
+          hermesSharedProcessScope: options.hermesSharedProcessScope,
           providerParams: override?.params,
         }),
       contract: PROVIDER_CONTRACTS[definition.id] ?? UNSUPPORTED_PROVIDER_CONTRACT,
@@ -744,7 +746,7 @@ function buildResolvedBuiltinProviders(
 function addDerivedProviders(
   resolvedProviders: Map<string, ResolvedProvider>,
   providerOverrides: Record<string, ProviderOverride>,
-  options: Pick<BuildProviderRegistryOptions, "managedProcesses">,
+  options: Pick<BuildProviderRegistryOptions, "managedProcesses" | "hermesSharedProcessScope">,
 ): void {
   for (const [providerId, override] of Object.entries(providerOverrides)) {
     if (resolvedProviders.has(providerId) || BUILTIN_PROVIDER_IDS.includes(providerId)) {
@@ -789,6 +791,8 @@ function addDerivedProviders(
             providerId,
             label: override.label ?? providerId,
             providerParams: override.params,
+            sharedProcessScope:
+              providerId === "hermes" ? options.hermesSharedProcessScope : undefined,
           };
           if (providerId === "cursor") {
             return new CursorACPAgentClient(acpOptions);
@@ -840,6 +844,7 @@ function addDerivedProviders(
       createBaseClient: (logger) =>
         baseFactory(logger, mergedRuntimeSettings, {
           managedProcesses: options.managedProcesses,
+          hermesSharedProcessScope: options.hermesSharedProcessScope,
           providerParams,
           customProvider: {
             id: providerId,
@@ -865,11 +870,13 @@ export function buildProviderRegistry(
       workspaceGitService: options?.workspaceGitService,
       managedProcesses: options?.managedProcesses,
       ompRuntime: options?.ompRuntime,
+      hermesSharedProcessScope: options?.hermesSharedProcessScope,
     },
     options?.isDev === true,
   );
   addDerivedProviders(resolvedProviders, providerOverrides, {
     managedProcesses: options?.managedProcesses,
+    hermesSharedProcessScope: options?.hermesSharedProcessScope,
   });
 
   return Object.fromEntries(

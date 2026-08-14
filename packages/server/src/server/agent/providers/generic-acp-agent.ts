@@ -51,6 +51,7 @@ interface GenericACPAgentClientOptions {
   configFeatureOptions?: ACPConfigFeatureOption[];
   extensionCommandsParser?: ACPExtensionCommandsParser;
   catalogModelResolver?: ACPCatalogModelResolver;
+  sharedProcessScope?: object;
 }
 
 export class GenericACPAgentClient extends ACPAgentClient {
@@ -77,6 +78,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
       extensionCommandsParser: options.extensionCommandsParser,
       catalogModelResolver: options.catalogModelResolver,
       shareProcess: options.providerId === "hermes",
+      sharedProcessScope: options.sharedProcessScope,
     });
 
     this.command = options.command;

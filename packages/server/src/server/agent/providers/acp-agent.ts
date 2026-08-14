@@ -459,6 +459,36 @@ interface ACPAgentClientOptions {
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
   shareProcess?: boolean;
+  sharedProcessScope?: object;
+}
+
+interface ACPSharedProcessState {
+  host: Promise<ACPSharedProcessHost> | null;
+  launchEnvKey: string | null;
+  initializationAbort: (() => Promise<void>) | null;
+}
+
+const SHARED_PROCESS_STATES = new WeakMap<object, ACPSharedProcessState>();
+
+function createACPSharedProcessState(): ACPSharedProcessState {
+  return {
+    host: null,
+    launchEnvKey: null,
+    initializationAbort: null,
+  };
+}
+
+function resolveACPSharedProcessState(scope?: object): ACPSharedProcessState {
+  if (!scope) {
+    return createACPSharedProcessState();
+  }
+  const existing = SHARED_PROCESS_STATES.get(scope);
+  if (existing) {
+    return existing;
+  }
+  const state = createACPSharedProcessState();
+  SHARED_PROCESS_STATES.set(scope, state);
+  return state;
 }
 
 interface ACPAgentSessionOptions {
@@ -874,9 +904,7 @@ export class ACPAgentClient implements AgentClient {
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   protected readonly terminateProcess: ProcessTerminator;
   private readonly shareProcess: boolean;
-  private sharedProcessHost: Promise<ACPSharedProcessHost> | null = null;
-  private sharedProcessLaunchEnvKey: string | null = null;
-  private sharedProcessInitializationAbort: (() => Promise<void>) | null = null;
+  private readonly sharedProcessState: ACPSharedProcessState;
   private sharedCatalog: ProviderCatalog | null = null;
   private sharedCatalogRequest: Promise<ProviderCatalog> | null = null;
 
@@ -907,6 +935,7 @@ export class ACPAgentClient implements AgentClient {
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
     this.extensionCommandsParser = options.extensionCommandsParser;
     this.shareProcess = options.shareProcess ?? false;
+    this.sharedProcessState = resolveACPSharedProcessState(options.sharedProcessScope);
   }
 
   async createSession(
@@ -1439,12 +1468,14 @@ export class ACPAgentClient implements AgentClient {
     const requestedLaunchEnvKey = stableEnvKey(sharedLaunchEnv);
     for (;;) {
       const launchEnvKey =
-        reuseActiveLaunchEnvironment && this.sharedProcessHost && this.sharedProcessLaunchEnvKey
-          ? this.sharedProcessLaunchEnvKey
+        reuseActiveLaunchEnvironment &&
+        this.sharedProcessState.host &&
+        this.sharedProcessState.launchEnvKey
+          ? this.sharedProcessState.launchEnvKey
           : requestedLaunchEnvKey;
-      if (this.sharedProcessHost && this.sharedProcessLaunchEnvKey !== launchEnvKey) {
+      if (this.sharedProcessState.host && this.sharedProcessState.launchEnvKey !== launchEnvKey) {
         const existingHost = await this.awaitSharedProcessHost(
-          this.sharedProcessHost,
+          this.sharedProcessState.host,
           initializeTimeoutMs,
         );
         if (existingHost.isStopped()) {
@@ -1459,24 +1490,27 @@ export class ACPAgentClient implements AgentClient {
           "Shared ACP sessions require the same launch environment; refusing to reuse a process with different environment values",
         );
       }
-      if (!this.sharedProcessHost) {
+      if (!this.sharedProcessState.host) {
         let hostPromise: Promise<ACPSharedProcessHost>;
         hostPromise = this.createSharedProcessHost(sharedLaunchEnv, initializeTimeoutMs, () => {
-          if (this.sharedProcessHost === hostPromise) {
-            this.sharedProcessHost = null;
-            this.sharedProcessLaunchEnvKey = null;
+          if (this.sharedProcessState.host === hostPromise) {
+            this.sharedProcessState.host = null;
+            this.sharedProcessState.launchEnvKey = null;
           }
         });
-        this.sharedProcessHost = hostPromise;
-        this.sharedProcessLaunchEnvKey = launchEnvKey;
+        this.sharedProcessState.host = hostPromise;
+        this.sharedProcessState.launchEnvKey = launchEnvKey;
         void hostPromise.catch(() => {
-          if (this.sharedProcessHost === hostPromise) {
-            this.sharedProcessHost = null;
-            this.sharedProcessLaunchEnvKey = null;
+          if (this.sharedProcessState.host === hostPromise) {
+            this.sharedProcessState.host = null;
+            this.sharedProcessState.launchEnvKey = null;
           }
         });
       }
-      const host = await this.awaitSharedProcessHost(this.sharedProcessHost, initializeTimeoutMs);
+      const host = await this.awaitSharedProcessHost(
+        this.sharedProcessState.host,
+        initializeTimeoutMs,
+      );
       if (host.isStopped()) {
         await host.whenStopped();
         continue;
@@ -1496,12 +1530,15 @@ export class ACPAgentClient implements AgentClient {
         `ACP initialize timed out after ${timeoutMs}ms`,
       );
     } catch (error) {
-      if (this.sharedProcessHost === hostPromise && this.sharedProcessInitializationAbort) {
-        const abort = this.sharedProcessInitializationAbort;
+      if (
+        this.sharedProcessState.host === hostPromise &&
+        this.sharedProcessState.initializationAbort
+      ) {
+        const abort = this.sharedProcessState.initializationAbort;
         void abort().then(() => {
-          if (this.sharedProcessHost === hostPromise) {
-            this.sharedProcessHost = null;
-            this.sharedProcessLaunchEnvKey = null;
+          if (this.sharedProcessState.host === hostPromise) {
+            this.sharedProcessState.host = null;
+            this.sharedProcessState.launchEnvKey = null;
           }
           return undefined;
         });
@@ -1522,7 +1559,7 @@ export class ACPAgentClient implements AgentClient {
       cleanupPromise ??= terminateChildProcess(transport.child, 2_000, this.terminateProcess, true);
       return cleanupPromise;
     };
-    this.sharedProcessInitializationAbort = abortInitialization;
+    this.sharedProcessState.initializationAbort = abortInitialization;
     try {
       const initialize = await this.initializeTransport(transport, initializeTimeoutMs);
       return new ACPSharedProcessHost({
@@ -1538,8 +1575,8 @@ export class ACPAgentClient implements AgentClient {
       await abortInitialization();
       throw error;
     } finally {
-      if (this.sharedProcessInitializationAbort === abortInitialization) {
-        this.sharedProcessInitializationAbort = null;
+      if (this.sharedProcessState.initializationAbort === abortInitialization) {
+        this.sharedProcessState.initializationAbort = null;
       }
     }
   }

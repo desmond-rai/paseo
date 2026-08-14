@@ -204,6 +204,7 @@ export class ProviderSnapshotManager {
   private readonly managedProcesses?: ManagedProcessRegistry;
   private readonly isDev: boolean;
   private readonly extraClients: Partial<Record<AgentProvider, AgentClient>>;
+  private readonly hermesSharedProcessScope = {};
   private runtimeSettings: AgentProviderRuntimeSettingsMap | undefined;
   private providerOverrides: Record<string, ProviderOverride> | undefined;
   private baseProviderOverrides: Record<string, ProviderOverride> | undefined;
@@ -511,6 +512,7 @@ export class ProviderSnapshotManager {
       workspaceGitService: this.workspaceGitService,
       managedProcesses: this.managedProcesses,
       isDev: this.isDev,
+      hermesSharedProcessScope: this.hermesSharedProcessScope,
     });
 
     for (const [provider, client] of Object.entries(this.extraClients) as Array<

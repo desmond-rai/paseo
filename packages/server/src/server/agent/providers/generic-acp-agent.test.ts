@@ -68,10 +68,15 @@ describe("GenericACPAgentClient", () => {
   });
 
   test("shares the ACP process only for the built-in Hermes provider", () => {
-    const hermesClient = new GenericACPAgentClient({
+    const sharedProcessScope = {};
+    const hermesOptions = {
       logger: createTestLogger(),
-      command: ["hermes", "acp"],
+      command: ["hermes", "acp"] as [string, ...string[]],
       providerId: "hermes",
+      sharedProcessScope,
+    };
+    const hermesClient = new GenericACPAgentClient({
+      ...hermesOptions,
     });
     const otherClient = new GenericACPAgentClient({
       logger: createTestLogger(),
@@ -81,7 +86,10 @@ describe("GenericACPAgentClient", () => {
     void hermesClient;
     void otherClient;
 
-    expect(mockState.superConstructorOptions.at(-2)).toMatchObject({ shareProcess: true });
+    expect(mockState.superConstructorOptions.at(-2)).toMatchObject({
+      shareProcess: true,
+      sharedProcessScope,
+    });
     expect(mockState.superConstructorOptions.at(-1)).toMatchObject({ shareProcess: false });
   });
 

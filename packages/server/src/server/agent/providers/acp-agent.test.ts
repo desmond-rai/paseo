@@ -95,6 +95,68 @@ describe("buildACPClientCapabilities", () => {
 });
 
 describe("ACPAgentClient shared process", () => {
+  test("shares one process across replacement clients in the same daemon scope", async () => {
+    const sharedProcessScope = {};
+    let spawnCount = 0;
+    let sessionCount = 0;
+
+    class TestSharedACPAgentClient extends ACPAgentClient {
+      constructor() {
+        const options = {
+          provider: "acp",
+          logger: createTestLogger(),
+          defaultCommand: ["hermes", "acp"] as [string, ...string[]],
+          shareProcess: true,
+          sharedProcessScope,
+        };
+        super(options);
+      }
+
+      protected override async spawnTransport(
+        _launchEnv?: Record<string, string>,
+        clientFactory?: () => ACPClient,
+      ): Promise<ACPProcessTransport> {
+        spawnCount += 1;
+        clientFactory?.();
+        return {
+          child: createProbeChildStub(),
+          connection: {
+            initialize: vi.fn().mockResolvedValue({
+              protocolVersion: PROTOCOL_VERSION,
+              agentCapabilities: {},
+            }),
+            newSession: vi.fn(async () => ({ sessionId: `session-${++sessionCount}` })),
+          } as unknown as ClientSideConnection,
+          stderrChunks: [],
+          spawnReady: Promise.resolve(),
+          spawnError: new Promise<never>(() => undefined),
+        };
+      }
+    }
+
+    const originalClient = new TestSharedACPAgentClient();
+    const originalSession = await originalClient.createSession({
+      provider: "acp",
+      cwd: "/tmp/original",
+    });
+    const replacementClient = new TestSharedACPAgentClient();
+    const replacementSession = await replacementClient.createSession({
+      provider: "acp",
+      cwd: "/tmp/replacement",
+    });
+
+    expect(spawnCount).toBe(1);
+    expect(originalSession.id).not.toBe(replacementSession.id);
+    await expect(
+      replacementClient.createSession(
+        { provider: "acp", cwd: "/tmp/different-environment" },
+        { env: { CUSTOM_VALUE: "different" } },
+      ),
+    ).rejects.toThrow("Shared ACP sessions require the same launch environment");
+    expect(spawnCount).toBe(1);
+    await Promise.all([originalSession.close(), replacementSession.close()]);
+  });
+
   test("coalesces catalog probes and creates ten sessions on one process", async () => {
     class TestSharedACPAgentClient extends ACPAgentClient {
       readonly newSession = vi.fn(async () => ({
