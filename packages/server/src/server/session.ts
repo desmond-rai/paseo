@@ -88,6 +88,7 @@ import {
   archiveAgentCommand,
   cancelAgentRunCommand,
   closeAgentCommand,
+  deleteAgentPermanentlyCommand,
   detachAgentCommand,
   setAgentModeCommand,
   updateAgentCommand,
@@ -2548,13 +2549,15 @@ export class Session {
     // durable snapshot, otherwise an in-flight background write can recreate it.
     await this.agentManager.flush();
 
-    if (knownProvider) {
-      await this.agentManager.deleteProviderAgentResources(agentId, knownProvider);
-    }
-
     try {
-      await this.agentStorage.remove(agentId);
-      await this.agentManager.deleteAgentState(agentId);
+      await deleteAgentPermanentlyCommand(
+        {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        },
+        { agentId, provider: knownProvider },
+      );
     } catch (error) {
       this.sessionLogger.error({ err: error, agentId }, `Failed to fully delete agent ${agentId}`);
     }
