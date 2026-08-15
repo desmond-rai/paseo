@@ -154,6 +154,34 @@ describe("GenericACPAgentClient diagnostics", () => {
     });
   });
 
+  test("launches a real ACP subprocess inside the prepared Hermes profile home", async () => {
+    await withFakeACPAgent("success", async (scriptPath, mode, testDir) => {
+      const envTracePath = path.join(testDir, "env.json");
+      const client = new GenericACPAgentClient({
+        logger: createTestLogger(),
+        command: [process.execPath, scriptPath, mode, "", "", envTracePath],
+        providerId: "hermes",
+        hermesProfileManager: {
+          async prepare(agentId: string) {
+            expect(agentId).toBe("agent-isolated");
+            return { profile: "paseo-isolated", home: "/profiles/paseo-isolated" };
+          },
+        },
+      });
+
+      const session = await client.createSession(
+        { provider: "acp", cwd: testDir },
+        { agentId: "agent-isolated" },
+      );
+      await session.close();
+
+      expect(JSON.parse(await readFile(envTracePath, "utf8"))).toEqual({
+        HERMES_HOME: "/profiles/paseo-isolated",
+        HERMES_PROFILE: "paseo-isolated",
+      });
+    });
+  });
+
   test("reports a missing launcher without dropping the rest of the diagnostic", async () => {
     await withTempDir("paseo-missing-acp-agent-", async (testDir) => {
       const missingCommand = path.join(testDir, "missing-acp-agent");
@@ -230,8 +258,15 @@ const readline = require("node:readline");
 const mode = process.argv[2];
 const pidPath = process.argv[3];
 const initializeTracePath = process.argv[4];
+const envTracePath = process.argv[5];
 if (pidPath) {
   fs.writeFileSync(pidPath, String(process.pid));
+}
+if (envTracePath) {
+  fs.writeFileSync(
+    envTracePath,
+    JSON.stringify({ HERMES_HOME: process.env.HERMES_HOME, HERMES_PROFILE: process.env.HERMES_PROFILE }),
+  );
 }
 const rl = readline.createInterface({ input: process.stdin });
 

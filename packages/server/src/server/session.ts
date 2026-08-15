@@ -2527,10 +2527,10 @@ export class Session {
   private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
 
-    const knownWorkspaceId =
-      this.agentManager.getAgent(agentId)?.workspaceId ??
-      (await this.agentStorage.get(agentId))?.workspaceId ??
-      null;
+    const activeAgent = this.agentManager.getAgent(agentId);
+    const storedAgent = await this.agentStorage.get(agentId);
+    const knownWorkspaceId = activeAgent?.workspaceId ?? storedAgent?.workspaceId ?? null;
+    const knownProvider = activeAgent?.provider ?? storedAgent?.provider ?? null;
 
     // File-backed storage still needs an early delete fence before closeAgent().
     beginAgentDeleteIfSupported(this.agentStorage, agentId);
@@ -2547,6 +2547,10 @@ export class Session {
     // Drain queued persistence from the just-closed agent before removing its
     // durable snapshot, otherwise an in-flight background write can recreate it.
     await this.agentManager.flush();
+
+    if (knownProvider) {
+      await this.agentManager.deleteProviderAgentResources(agentId, knownProvider);
+    }
 
     try {
       await this.agentStorage.remove(agentId);
@@ -3499,7 +3503,11 @@ export class Session {
         : overrides;
       let snapshot: ManagedAgent;
       try {
-        snapshot = await this.agentManager.resumeAgentFromPersistence(handle, effectiveOverrides);
+        snapshot = await this.agentManager.resumeAgentFromPersistence(
+          handle,
+          effectiveOverrides,
+          matched?.record.id,
+        );
       } catch (error) {
         if (matched?.didUnarchive && matched.originalArchivedAt) {
           await this.agentManager.archiveSnapshot(matched.record.id, matched.originalArchivedAt);
