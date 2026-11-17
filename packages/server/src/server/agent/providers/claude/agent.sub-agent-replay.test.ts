@@ -7,6 +7,8 @@ import { generateReplayCorpus, generateWorkflowReplayCorpus } from "./replay-mem
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
+import { createIdleRuntimeCleanup } from "../../idle-runtime-cleanup/index.js";
+import { ProviderSubagentStore } from "../../provider-subagents/store.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 import { streamSession } from "../test-utils/session-stream-adapter.js";
 import { ClaudeAgentClient } from "./agent.js";
@@ -98,6 +100,74 @@ function buildQueryMock(events: unknown[]) {
     [Symbol.asyncIterator]() {
       return this;
     },
+  };
+}
+
+const PARENT_AGENT_ID = "parent-agent";
+const RESTART_NOTICE_AT = Date.parse("2026-07-26T06:30:00.000Z");
+
+/** Last status each replayed child reached, keyed by its descriptor id. */
+function lastSubagentStatusesById(
+  events: Extract<AgentStreamEvent, { type: "provider_subagent" }>[],
+): Record<string, string> {
+  const statuses: Record<string, string> = {};
+  for (const { event } of events) {
+    if (event.type === "upsert" && event.status) statuses[event.id] = event.status;
+  }
+  return statuses;
+}
+
+function applyReplayToSubagentStore(
+  events: Extract<AgentStreamEvent, { type: "provider_subagent" }>[],
+): ProviderSubagentStore {
+  const store = new ProviderSubagentStore();
+  for (const { event } of events) store.apply(PARENT_AGENT_ID, "claude", event);
+  return store;
+}
+
+function subagentStatuses(store: ProviderSubagentStore, parentAgentId: string): string[] {
+  return store.list(parentAgentId).map((child) => child.status);
+}
+
+function hasRunningChild(store: ProviderSubagentStore, parentAgentId: string): boolean {
+  return store.list(parentAgentId).some((child) => child.status === "running");
+}
+
+/**
+ * The agent manager's own veto (`runtimeHasNoPendingWork`): a provider child still marked running
+ * holds its parent runtime open, so the collector never sees an idle hour.
+ */
+function idleRuntimeCleanupHeldBySubagents(store: ProviderSubagentStore, lastActivityAt: number) {
+  let now = lastActivityAt;
+  let collected = false;
+  const cleanup = createIdleRuntimeCleanup({
+    enabled: true,
+    logger: createTestLogger(),
+    now: () => now,
+    schedule: () => () => {},
+    runtimes: () => [
+      {
+        identity: {},
+        agentId: PARENT_AGENT_ID,
+        parentAgentId: undefined,
+        provider: "claude",
+        sessionId: "replay-session",
+        lastActivityAt,
+        isEligible: () => !hasRunningChild(store, PARENT_AGENT_ID),
+        closeIfEligible: async () => {
+          collected = true;
+          return true;
+        },
+      },
+    ],
+  });
+  return {
+    sweepAt(minute: number) {
+      now = lastActivityAt + minute * 60_000;
+      return cleanup.sweep();
+    },
+    closed: () => collected,
+    close: () => cleanup.close(),
   };
 }
 
@@ -674,6 +744,116 @@ describe("ClaudeAgentSession persisted subagent replay", () => {
       });
 
       expect(upserts(await replayDescriptors()).at(-1)).toMatchObject({ status: "completed" });
+    });
+  });
+
+  describe("a process that died with children running", () => {
+    const SECOND_TOOL_USE_ID = "toolu_01SecondLaunch";
+    const SECOND_AGENT_ID = "b2810a6215e1f5cf7";
+
+    function launch(toolUseId: string, agentId: string): string[] {
+      return [
+        parentEntry([
+          {
+            type: "tool_use",
+            id: toolUseId,
+            name: "Agent",
+            input: {
+              subagent_type: "general-purpose",
+              description: "probe sleeper",
+              run_in_background: true,
+            },
+          },
+        ]),
+        JSON.stringify({
+          type: "user",
+          sessionId: "replay-session",
+          timestamp: "2026-07-26T06:27:48.000Z",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: toolUseId,
+                content: [
+                  { type: "text", text: `Async agent launched successfully.\nagentId: ${agentId}` },
+                ],
+              },
+            ],
+          },
+          toolUseResult: { isAsync: true, status: "async_launched", agentId },
+        }),
+      ];
+    }
+
+    /**
+     * The notice Claude Code 2.1.32x writes once, on the first resume after a kill: one user
+     * message naming every task the dead process left running, with no tool id to key them by.
+     */
+    function restartNotice(taskIds: readonly string[]): string {
+      const text = [
+        "<task-notification>",
+        ...taskIds.map((taskId) => `<task-id>${taskId}</task-id>`),
+        "<status>stopped</status>",
+        "<summary>Subagent stopped when Claude restarted</summary>",
+        "</task-notification>",
+      ].join("\n");
+      return JSON.stringify({
+        type: "user",
+        sessionId: "replay-session",
+        timestamp: "2026-07-26T06:30:00.000Z",
+        message: { role: "user", content: [{ type: "text", text }] },
+      });
+    }
+
+    function diedMidTool(agentId: string): string[] {
+      // Stopped between a tool call and its result: no end_turn, no interrupt placeholder.
+      return [sidechainEntry({ agentId, stopReason: "tool_use" })];
+    }
+
+    function writeKilledSession(): void {
+      const subagentDir = writeParentSession([
+        ...launch(TOOL_USE_ID, AGENT_ID),
+        ...launch(SECOND_TOOL_USE_ID, SECOND_AGENT_ID),
+        restartNotice([AGENT_ID, SECOND_AGENT_ID]),
+      ]);
+      for (const [agentId, toolUseId] of [
+        [AGENT_ID, TOOL_USE_ID],
+        [SECOND_AGENT_ID, SECOND_TOOL_USE_ID],
+      ] as const) {
+        writeSubagent({
+          subagentDir,
+          agentId,
+          meta: JSON.stringify({ toolUseId }),
+          sidechainLines: diedMidTool(agentId),
+        });
+      }
+    }
+
+    test("settles every child a restart notice names", async () => {
+      writeKilledSession();
+
+      expect(lastSubagentStatusesById(await replayDescriptors())).toMatchObject({
+        [TOOL_USE_ID]: "canceled",
+        [SECOND_TOOL_USE_ID]: "canceled",
+      });
+    });
+
+    test("lets the idle runtime cleanup collect the settled runtime", async () => {
+      writeKilledSession();
+      const store = applyReplayToSubagentStore(await replayDescriptors());
+      expect(subagentStatuses(store, PARENT_AGENT_ID)).toEqual(["canceled", "canceled"]);
+
+      const cleanup = idleRuntimeCleanupHeldBySubagents(store, RESTART_NOTICE_AT);
+      try {
+        expect((await cleanup.sweepAt(59)).collected).toEqual([]);
+        expect((await cleanup.sweepAt(61)).collected).toEqual([
+          { agentId: PARENT_AGENT_ID, provider: "claude", sessionId: "replay-session" },
+        ]);
+        expect(cleanup.closed()).toBe(true);
+      } finally {
+        await cleanup.close();
+      }
     });
   });
 

@@ -6497,12 +6497,9 @@ async function readClaudeReplayParentFacts(
   const toolCalls = new Map<string, { title?: string; description?: string }>();
   const linksByAgentId = new Map<string, { toolCallId: string }>();
   const outcomes: Map<string, { status: ProviderSubagentStatus }> = new Map();
+  const outcomesByAgentId: Map<string, { status: ProviderSubagentStatus }> = new Map();
   for await (const entry of entries) {
-    const notification = readTaskNotificationFromHistoryRecord(entry);
-    const status = mapTaskStatus(notification?.status ?? undefined);
-    if (notification?.toolUseId && status) {
-      outcomes.set(notification.toolUseId, { status });
-    }
+    recordReplayNotificationOutcome(entry, outcomes, outcomesByAgentId);
     const content = toObjectRecord(entry.message)?.content;
     if (!Array.isArray(content)) continue;
     for (const value of content) {
@@ -6530,7 +6527,28 @@ async function readClaudeReplayParentFacts(
     toolCalls,
     linksByAgentId,
     outcomesByToolCallId: new Map([...outcomes].filter(([id]) => toolCalls.has(id))),
+    outcomesByAgentId,
   };
+}
+
+/**
+ * Bank what a task notification says about the child it names.
+ *
+ * A notice may identify its child by tool call or by task id. Claude's one resume notice for the
+ * tasks a killed process left running names every one of them by task id and carries no tool id,
+ * so both keys are kept: the tool id settles a child linked through its Task call, and the task id
+ * settles one whose sidecar and transcript only carry its agentId.
+ */
+function recordReplayNotificationOutcome(
+  entry: ClaudeHistoryEntry,
+  outcomesByToolCallId: Map<string, { status: ProviderSubagentStatus }>,
+  outcomesByAgentId: Map<string, { status: ProviderSubagentStatus }>,
+): void {
+  const notification = readTaskNotificationFromHistoryRecord(entry);
+  const status = mapTaskStatus(notification?.status ?? undefined);
+  if (!status) return;
+  if (notification?.toolUseId) outcomesByToolCallId.set(notification.toolUseId, { status });
+  for (const taskId of notification?.taskIds ?? []) outcomesByAgentId.set(taskId, { status });
 }
 
 function readClaudeReplayTaskDeclaration(

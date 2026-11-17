@@ -15,6 +15,12 @@ const TaskNotificationEnvelopeSchema = z.object({
   notificationId: z.string().optional(),
   messageId: z.string().nullable(),
   taskId: z.string().nullable(),
+  /**
+   * Every task the notice names. Claude Code puts one `<task-id>` per task in the single notice it
+   * sends when it resumes a session a killed process left running, and that notice carries no
+   * tool id, so this list is the only way to match those outcomes to their children.
+   */
+  taskIds: z.array(z.string()),
   toolUseId: z.string().nullable(),
   status: z.string().nullable(),
   summary: z.string().nullable(),
@@ -145,6 +151,26 @@ function readTaskNotificationTagValue(input: ReadTaskNotificationTagInput): stri
   return toNonEmptyString(match[1]);
 }
 
+/** Every value of a repeated tag, in order, without duplicates. */
+function readTaskNotificationTagValues(input: ReadTaskNotificationTagInput): string[] {
+  const escapedTagName = input.tagName.replace(TAG_NAME_PATTERN, "\\$&");
+  const pattern = new RegExp(`<${escapedTagName}>\\s*([\\s\\S]*?)\\s*</${escapedTagName}>`, "gi");
+  const values: string[] = [];
+  for (const match of input.text.matchAll(pattern)) {
+    const value = toNonEmptyString(match[1]);
+    if (value && !values.includes(value)) values.push(value);
+  }
+  return values;
+}
+
+function readTaskIds(rawText: string | null, explicitTaskId: string | null): string[] {
+  const taskIds = rawText
+    ? readTaskNotificationTagValues({ text: rawText, tagName: "task-id" })
+    : [];
+  if (explicitTaskId && !taskIds.includes(explicitTaskId)) taskIds.unshift(explicitTaskId);
+  return taskIds;
+}
+
 function parseTaskNotificationFromUserContent(
   input: MapTaskNotificationUserContentToToolCallInput,
 ): TaskNotificationEnvelope | null {
@@ -162,6 +188,7 @@ function parseTaskNotificationFromUserContent(
     notificationId: parsedInput.data.notificationId,
     messageId: toNonEmptyString(parsedInput.data.messageId),
     taskId: readTaskNotificationTagValue({ text: rawText, tagName: "task-id" }),
+    taskIds: readTaskIds(rawText, null),
     toolUseId:
       readTaskNotificationTagValue({ text: rawText, tagName: "tool-use-id" }) ??
       readTaskNotificationTagValue({ text: rawText, tagName: "tool_use_id" }),
@@ -189,13 +216,15 @@ function parseTaskNotificationFromSystemRecord(record: unknown): TaskNotificatio
     return null;
   }
   const rawText = toNonEmptyString(systemRecord.content);
+  const taskId =
+    toNonEmptyString(systemRecord.task_id) ??
+    (rawText ? readTaskNotificationTagValue({ text: rawText, tagName: "task-id" }) : null);
 
   return TaskNotificationEnvelopeSchema.parse({
     notificationId: systemRecord.notificationId,
     messageId: toNonEmptyString(systemRecord.uuid) ?? toNonEmptyString(systemRecord.message_id),
-    taskId:
-      toNonEmptyString(systemRecord.task_id) ??
-      (rawText ? readTaskNotificationTagValue({ text: rawText, tagName: "task-id" }) : null),
+    taskId,
+    taskIds: readTaskIds(rawText, taskId),
     toolUseId:
       toNonEmptyString(systemRecord.tool_use_id) ??
       (rawText
@@ -264,6 +293,7 @@ function taskNotificationReplaySignature(envelope: TaskNotificationEnvelope): st
     .update(
       JSON.stringify([
         envelope.taskId,
+        envelope.taskIds,
         envelope.toolUseId,
         envelope.status,
         envelope.summary,
