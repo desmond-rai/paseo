@@ -27,6 +27,7 @@ import {
 } from "./workspace-registry.js";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import type { WorkspaceGitObserverService } from "./session/workspace-git-observer/workspace-git-observer-service.js";
+import type { AgentDirectory } from "./agent/directory.js";
 
 interface SessionInternals {
   buildWorkspaceDescriptorMap: () => Promise<Map<string, unknown>>;
@@ -121,6 +122,18 @@ function createWorkspaceRuntimeSnapshot(
   };
 }
 
+interface LiveAgentStub {
+  id: string;
+  workspaceId: string;
+  lifecycle: string;
+  session: object | null;
+}
+
+interface StoredAgentStub {
+  id: string;
+  workspaceId: string;
+}
+
 function createSessionForWorkspaceGitWatchTests(options?: {
   onBranchChanged?: (
     workspaceId: string,
@@ -129,6 +142,10 @@ function createSessionForWorkspaceGitWatchTests(options?: {
   ) => void;
   serviceProxy?: ServiceProxySubsystem;
   scriptRuntimeStore?: WorkspaceScriptRuntimeStore;
+  lastUserMessageAtByWorkspace?: Map<string, string>;
+  liveAgents?: LiveAgentStub[];
+  storedAgents?: Map<string, StoredAgentStub>;
+  terminalManager?: SessionOptions["terminalManager"];
 }): {
   session: Session;
   emitted: Array<{ type: string; payload: unknown }>;
@@ -148,8 +165,10 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     listener: WorkspaceGitListener;
     unsubscribe: ReturnType<typeof vi.fn>;
   }>;
+  emitAgentEvent: (event: unknown) => void;
 } {
   const emitted: Array<{ type: string; payload: unknown }> = [];
+  const agentEventSubscribers: Array<(event: unknown) => void> = [];
   const projects = new Map<string, ReturnType<typeof createPersistedProjectRecord>>();
   const workspaces = new Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>();
   const subscriptions: Array<{
@@ -202,17 +221,22 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     pushNotifications: createStub<SessionOptions["pushNotifications"]>({}),
     paseoHome: "/tmp/paseo-test",
     agentManager: createStub<SessionOptions["agentManager"]>({
-      subscribe: () => () => {},
-      listAgents: () => [],
+      subscribe: (callback: (event: unknown) => void) => {
+        agentEventSubscribers.push(callback);
+        return () => {};
+      },
+      listAgents: () => options?.liveAgents ?? [],
       listProviderSubagentActivity: () => [],
-      getAgent: () => null,
+      getAgent: (agentId: string) =>
+        (options?.liveAgents ?? []).find((agent) => agent.id === agentId) ?? null,
     }),
     agentStorage: createStub<SessionOptions["agentStorage"]>({
       listAll: async () => [],
       listActive: async () => [],
       listByWorkspaces: async () => [],
-      lastUserMessageAtByWorkspace: async () => new Map<string, string>(),
-      get: async () => null,
+      lastUserMessageAtByWorkspace: async () =>
+        options?.lastUserMessageAtByWorkspace ?? new Map<string, string>(),
+      get: async (agentId: string) => options?.storedAgents?.get(agentId) ?? null,
     }),
     projectRegistry: createStub<SessionOptions["projectRegistry"]>({
       subscribeToMutations: () => () => {},
@@ -273,7 +297,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     stt: null,
     tts: null,
     providerSnapshotManager: createProviderSnapshotManagerStub().manager,
-    terminalManager: null,
+    terminalManager: options?.terminalManager ?? null,
     serviceProxy: options?.serviceProxy,
     scriptRuntimeStore: options?.scriptRuntimeStore,
     onBranchChanged: options?.onBranchChanged,
@@ -289,6 +313,9 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     workspaces,
     workspaceGitService,
     subscriptions,
+    emitAgentEvent: (event: unknown) => {
+      for (const subscriber of agentEventSubscribers) subscriber(event);
+    },
   };
 }
 
@@ -299,6 +326,7 @@ function seedGitWorkspace(input: {
   workspaceId: string;
   cwd: string;
   name: string;
+  updatedAt?: string;
 }) {
   input.projects.set(
     input.projectId,
@@ -319,8 +347,8 @@ function seedGitWorkspace(input: {
       cwd: input.cwd,
       displayName: input.name,
       kind: "local_checkout",
-      createdAt: "2026-03-01T12:00:00.000Z",
-      updatedAt: "2026-03-01T12:00:00.000Z",
+      createdAt: input.updatedAt ?? "2026-03-01T12:00:00.000Z",
+      updatedAt: input.updatedAt ?? "2026-03-01T12:00:00.000Z",
     }),
   );
 }
@@ -784,5 +812,134 @@ describe("workspace git watch targets", () => {
     expect(workspaceGitService.refresh).not.toHaveBeenCalled();
     expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith(REPO_CWD);
     expect(emitted.find((message) => message.type === "checkout_pr_status_response")).toBeDefined();
+  });
+});
+
+describe("workspace git observation window", () => {
+  const ACTIVE_CWD = "/tmp/repo-active";
+  const IDLE_CWD = "/tmp/repo-idle";
+  const OPENED_CWD = "/tmp/repo-opened";
+  const TERMINAL_CWD = "/tmp/repo-terminal";
+
+  /** The cwds the observer asked the git service to watch. */
+  function watchedCwds(workspaceGitService: {
+    registerWorkspace: ReturnType<typeof vi.fn>;
+  }): string[] {
+    return workspaceGitService.registerWorkspace.mock.calls.map(
+      ([params]) => (params as { cwd: string }).cwd,
+    );
+  }
+
+  /** Recency only reaches the session through the agent directory; stub it per test. */
+  function stubLastPromptTimes(session: Session, times: Map<string, string>): void {
+    const directory = asInternals<{ agentDirectory: AgentDirectory }>(session).agentDirectory;
+    directory.workspaceLastUserMessageTimes = async () => times;
+  }
+
+  function createTerminalManagerStub(): SessionOptions["terminalManager"] {
+    return createStub<NonNullable<SessionOptions["terminalManager"]>>({
+      listDirectories: () => [TERMINAL_CWD],
+      getTerminals: async (cwd: string) => [
+        { id: `terminal-${cwd}`, cwd, workspaceId: "ws-terminal" },
+      ],
+      getTerminal: () => null,
+      subscribeTerminalsChanged: () => () => {},
+      subscribeTerminalWorkspaceContributionChanged: () => () => {},
+    });
+  }
+
+  function seedWatchWindowWorkspaces(input: {
+    projects: Map<string, ReturnType<typeof createPersistedProjectRecord>>;
+    workspaces: Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>;
+  }): void {
+    // Ten days quiet: outside the three-day window, with no runtime and no terminal.
+    const stale = new Date(Date.now() - 10 * 24 * 60 * 60_000).toISOString();
+    const workspaces = [
+      { workspaceId: "ws-active", cwd: ACTIVE_CWD, name: "active", updatedAt: undefined },
+      { workspaceId: "ws-idle", cwd: IDLE_CWD, name: "idle", updatedAt: stale },
+      { workspaceId: "ws-opened", cwd: OPENED_CWD, name: "opened", updatedAt: stale },
+      { workspaceId: "ws-terminal", cwd: TERMINAL_CWD, name: "terminal", updatedAt: stale },
+    ];
+    for (const workspace of workspaces) {
+      seedGitWorkspace({ ...input, projectId: "proj-1", ...workspace });
+    }
+  }
+
+  test("observes only workspaces with something live in them, and re-arms on demand", async () => {
+    const liveAgents: LiveAgentStub[] = [];
+    const { session, projects, workspaces, workspaceGitService, emitAgentEvent } =
+      createSessionForWorkspaceGitWatchTests({
+        liveAgents,
+        storedAgents: new Map([
+          ["agent-in-opened", { id: "agent-in-opened", workspaceId: "ws-opened" }],
+        ]),
+        terminalManager: createTerminalManagerStub(),
+      });
+    seedWatchWindowWorkspaces({ projects, workspaces });
+    const recent = new Date(Date.now() - 60 * 60_000).toISOString();
+    stubLastPromptTimes(session, new Map([["ws-active", recent]]));
+
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "window-demand",
+      subscribe: {},
+    });
+
+    // A recently prompted workspace and one holding a terminal are watched. The quiet ones are
+    // not, even though the client's sidebar lists them all.
+    expect(watchedCwds(workspaceGitService).sort()).toEqual([ACTIVE_CWD, TERMINAL_CWD].sort());
+
+    // An agent loading in the idle workspace arms its observer.
+    const idleAgent = { id: "agent-idle", workspaceId: "ws-idle", lifecycle: "idle", session: {} };
+    liveAgents.push(idleAgent);
+    emitAgentEvent({ type: "agent_state", agent: idleAgent });
+    await vi.waitFor(() => expect(watchedCwds(workspaceGitService)).toContain(IDLE_CWD));
+
+    // A client opening a workspace arms it too: its heartbeat names the agent on screen.
+    const socket = {};
+    session.updateClientCapabilities({}, socket);
+    await session.handleMessage(
+      {
+        type: "client_heartbeat",
+        deviceType: "web",
+        focusedAgentId: "agent-in-opened",
+        focusedTerminalId: null,
+        lastActivityAt: new Date().toISOString(),
+        appVisible: true,
+      },
+      socket,
+    );
+    await vi.waitFor(() => expect(watchedCwds(workspaceGitService)).toContain(OPENED_CWD));
+
+    await session.cleanup();
+  });
+
+  test("still answers an explicit checkout status request for an unobserved workspace", async () => {
+    const { session, emitted, projects, workspaces, workspaceGitService } =
+      createSessionForWorkspaceGitWatchTests();
+    seedWatchWindowWorkspaces({ projects, workspaces });
+    stubLastPromptTimes(session, new Map());
+
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "unobserved-demand",
+      subscribe: {},
+    });
+    expect(watchedCwds(workspaceGitService)).toEqual([]);
+
+    await session.handleMessage({
+      type: "checkout_status_request",
+      cwd: IDLE_CWD,
+      requestId: "idle-status",
+    });
+
+    expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith(IDLE_CWD);
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        type: "checkout_status_response",
+        payload: expect.objectContaining({ cwd: IDLE_CWD, requestId: "idle-status" }),
+      }),
+    );
+    await session.cleanup();
   });
 });

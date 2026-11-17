@@ -19,3 +19,9 @@ Git owns Git-ignore evaluation. The observer accepts absolute excluded roots and
 Workspace Git verifies each repository metadata subscription with a one-shot canary inside the Git directory. If the event does not round-trip through the subscription callback, treat the watcher as unavailable and enter degraded polling. Refresh working-tree Git-ignore exclusions from ignore-file events, newly observed directories, and watcher recovery, never from a healthy-watcher timer. `git ls-files` reports an ignored directory only once it exists, so new directory topology is a trigger in its own right; the refresh is edge-triggered per directory and debounced so a dependency install collapses into a couple of Git runs.
 
 The real-filesystem contracts and daemon auto-archive lifecycle run in the normal server test suite. Use the scripts only for manual performance and soak work: `npm run measure:file-observer --workspace=@getpaseo/server` measures burst and sustained-create behavior, and `npm run repro:file-observer-teardown --workspace=@getpaseo/server` runs the teardown soak.
+
+## Which workspaces are observed
+
+A client subscribed to `checkout_status_update` asks about every non-archived workspace, but the daemon only watches the ones something is using: a loaded agent runtime, an attached terminal, a client looking at it, or a prompt within three days (`WORKSPACE_GIT_OBSERVER_ACTIVITY_WINDOW_MS`). Every watched checkout costs a self-heal tick, a PR poll and a periodic fetch, so a quiet workspace loses its observer on the next reconcile and its sidebar row keeps the git facts from its last update.
+
+Loading an agent in a workspace, creating or attaching a terminal, and opening the workspace in a client each re-arm observation on their own. An explicit `checkout_status_request` reads the checkout without an observer, so it answers for any workspace.

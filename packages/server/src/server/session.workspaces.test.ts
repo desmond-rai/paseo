@@ -9986,6 +9986,9 @@ test("workspace PR status survives session cleanup and reconnect", async () => {
     createdAt: "2026-03-01T12:00:00.000Z",
     updatedAt: "2026-03-01T12:00:00.000Z",
   });
+  // Recently created: git observation covers a workspace this fresh. A workspace untouched for
+  // days is not polled until something opens it (see WORKSPACE_GIT_OBSERVER_ACTIVITY_WINDOW_MS).
+  const createdAt = new Date().toISOString();
   const workspace = createPersistedWorkspaceRecord({
     workspaceId: "ws-repro",
     projectId: project.projectId,
@@ -9994,8 +9997,8 @@ test("workspace PR status survives session cleanup and reconnect", async () => {
     isPaseoOwnedWorktree: false,
     mainRepoRoot: null,
     displayName: "repro",
-    createdAt: "2026-03-01T12:00:00.000Z",
-    updatedAt: "2026-03-01T12:00:00.000Z",
+    createdAt,
+    updatedAt: createdAt,
   });
   const projectRegistry: SessionOptions["projectRegistry"] = {
     initialize: async () => {},

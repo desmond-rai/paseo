@@ -368,6 +368,17 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
 
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
 
+/**
+ * How long a workspace stays worth polling git for after its last human prompt.
+ *
+ * A client subscribed to `checkout_status_update` makes every non-archived workspace a candidate,
+ * and each watched checkout costs a 60s self-heal tick, a 20s/120s PR poll and a 180s fetch. A
+ * workspace nobody has prompted in for three days is being read, not used: its sidebar row keeps
+ * the git facts from its last update, and opening it (or an agent in it, or a terminal) re-arms
+ * the observer on its own.
+ */
+export const WORKSPACE_GIT_OBSERVER_ACTIVITY_WINDOW_MS = 3 * 24 * 60 * 60_000;
+
 export function resolveWaitForFinishError(options: {
   status: "permission" | "error" | "idle";
   final: AgentSnapshotPayload | null;
@@ -722,6 +733,11 @@ function workspaceLabelErrorCode(error: unknown): string {
   return "workspace_label_failed";
 }
 
+type WorkspaceGitObservationTarget = Pick<
+  WorkspaceDescriptorPayload,
+  "id" | "workspaceDirectory" | "workspaceKind"
+>;
+
 interface ClientActivity {
   deviceType: "web" | "mobile";
   focusedAgentId: string | null;
@@ -863,6 +879,8 @@ export class Session {
   private readonly workspaceSetupRuntime: WorkspaceSetupRuntime;
   private readonly workspaceArchiveOperations: WorkspaceArchiveOperations;
   private readonly workspaceGitObserver: WorkspaceGitObserverService;
+  /** Workspace ids the git observer currently watches, as of the last reconcile or re-arm. */
+  private observedWorkspaceGitIds = new Set<string>();
   private readonly workspaceDirectory: WorkspaceDirectory;
   private readonly voiceSessions: VoiceSessions;
   private readonly checkoutSession: CheckoutSession;
@@ -2170,6 +2188,14 @@ export class Session {
             },
             "agent.session.forward_update",
           );
+          if (event.agent.lifecycle !== "closed" && event.agent.workspaceId) {
+            void this.rearmWorkspaceGitObserver(event.agent.workspaceId).catch((error) =>
+              this.sessionLogger.warn(
+                { err: error, workspaceId: event.agent.workspaceId },
+                "Failed to arm workspace git observation for a loaded agent",
+              ),
+            );
+          }
           void this.agentUpdates.forwardLiveAgent(event.agent);
           return;
         }
@@ -3513,9 +3539,41 @@ export class Session {
         return this.handleWorkspaceScriptStartRequest(msg);
       case "workspace.script.stop.request":
         return this.handleWorkspaceScriptStopRequest(msg);
+      case "create_terminal_request":
+      case "subscribe_terminal_request": {
+        const dispatched = this.terminalController.dispatch(msg, this.delivery);
+        if (!dispatched) return dispatched;
+        return dispatched.then(() => this.rearmWorkspaceGitObserverForTerminal(msg));
+      }
       default:
         return this.terminalController.dispatch(msg, this.delivery);
     }
+  }
+
+  /** A terminal in a workspace is a reason to watch its git state again. */
+  private async rearmWorkspaceGitObserverForTerminal(
+    msg: Extract<
+      SessionInboundMessage,
+      { type: "create_terminal_request" } | { type: "subscribe_terminal_request" }
+    >,
+  ): Promise<void> {
+    const workspaceIds = new Set<string>();
+    if (msg.type === "subscribe_terminal_request") {
+      const terminal = this.terminalManager?.getTerminal(msg.terminalId);
+      if (terminal?.workspaceId) workspaceIds.add(terminal.workspaceId);
+    } else if (msg.workspaceId) {
+      workspaceIds.add(msg.workspaceId);
+    }
+    await Promise.all(
+      [...workspaceIds].map((workspaceId) =>
+        this.rearmWorkspaceGitObserver(workspaceId).catch((error) =>
+          this.sessionLogger.warn(
+            { err: error, workspaceId },
+            "Failed to arm workspace git observation for an attached terminal",
+          ),
+        ),
+      ),
+    );
   }
 
   private dispatchScheduleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
@@ -5471,6 +5529,7 @@ export class Session {
       ? new Date(msg.appVisibilityChangedAt)
       : new Date(msg.lastActivityAt);
     const metadata = this.currentClientMetadata();
+    const previousFocus = metadata.activity;
     metadata.activity = {
       deviceType: msg.deviceType,
       focusedAgentId: msg.focusedAgentId,
@@ -5479,6 +5538,16 @@ export class Session {
       appVisible: msg.appVisible,
       appVisibilityChangedAt,
     };
+    if (
+      this.hasWorkspaceGitObservationDemand() &&
+      (previousFocus?.focusedAgentId !== msg.focusedAgentId ||
+        previousFocus?.focusedTerminalId !== focusedTerminalId)
+    ) {
+      // Opening a workspace arms its observer; moving focus away drops it on this reconcile.
+      void this.reconcileWorkspaceGitObservers().catch((error) =>
+        this.sessionLogger.warn({ err: error }, "Failed to reconcile workspace git observers"),
+      );
+    }
     if (msg.appVisible && focusedTerminalId) {
       void this.clearFocusedTerminalAttention(focusedTerminalId);
     }
@@ -7256,17 +7325,136 @@ export class Session {
   }
 
   private async reconcileWorkspaceGitObservers(): Promise<void> {
-    const all = this.wantsEvent("checkout_status_update")
-      ? await this.workspaceDirectory.listObservationTargets()
-      : [];
-    const entries = [...this.workspaceUpdatesSubscriptions.values()].flatMap((subscription) =>
-      [...subscription.lastEmittedByWorkspaceId.values()].flatMap((update) =>
-        update.kind === "upsert" ? [update.workspace] : [],
-      ),
+    const candidates = new Map<string, WorkspaceGitObservationTarget>();
+    if (this.wantsEvent("checkout_status_update")) {
+      for (const target of await this.workspaceDirectory.listObservationTargets()) {
+        candidates.set(target.id, target);
+      }
+    }
+    for (const subscription of this.workspaceUpdatesSubscriptions.values()) {
+      for (const update of subscription.lastEmittedByWorkspaceId.values()) {
+        if (update.kind !== "upsert") continue;
+        candidates.set(update.workspace.id, update.workspace);
+      }
+    }
+    const retained = await this.retainedWorkspaceGitObservationTargets(candidates);
+    this.observedWorkspaceGitIds = new Set(retained.map((target) => target.id));
+    this.workspaceGitObserver.reconcileObservers(retained);
+  }
+
+  /**
+   * Keep the workspaces something in the session is actually using, drop the quiet ones.
+   *
+   * Observation is a foreground concern. Subscribing to `checkout_status_update` used to make
+   * every workspace the daemon knew about a polling target for as long as any client was
+   * connected, which is a per-checkout timer set nobody is looking at.
+   */
+  private async retainedWorkspaceGitObservationTargets(
+    candidates: ReadonlyMap<string, WorkspaceGitObservationTarget>,
+  ): Promise<WorkspaceGitObservationTarget[]> {
+    if (candidates.size === 0) return [];
+    const targets = [...candidates.values()];
+    const [lastPromptAtByWorkspaceId, focusedWorkspaceIds] = await Promise.all([
+      this.agentDirectory.workspaceLastUserMessageTimes(candidates.keys()),
+      this.clientFocusedWorkspaceIds(),
+    ]);
+    const terminalWorkspaceIds = await this.terminalWorkspaceIds(targets);
+    const loadedWorkspaceIds = new Set(
+      this.agentManager
+        .listAgents()
+        .flatMap((agent) => (agent.workspaceId ? [agent.workspaceId] : [])),
     );
-    this.workspaceGitObserver.reconcileObservers(
-      this.wantsEvent("checkout_status_update") ? [...entries, ...all] : entries,
-    );
+    const retained: WorkspaceGitObservationTarget[] = [];
+    for (const target of targets) {
+      if (
+        loadedWorkspaceIds.has(target.id) ||
+        focusedWorkspaceIds.has(target.id) ||
+        terminalWorkspaceIds.has(target.id) ||
+        (await this.workspaceHadRecentActivity(target.id, lastPromptAtByWorkspaceId))
+      ) {
+        retained.push(target);
+      }
+    }
+    return retained;
+  }
+
+  /** Workspaces a client currently has in front of it: its focused agent's, or focused terminal's. */
+  private async clientFocusedWorkspaceIds(): Promise<Set<string>> {
+    const workspaceIds = new Set<string>();
+    for (const { activity } of this.clientSources.values()) {
+      if (!activity) continue;
+      if (activity.focusedAgentId) {
+        const workspaceId = await this.workspaceIdForAgent(activity.focusedAgentId);
+        if (workspaceId) workspaceIds.add(workspaceId);
+      }
+      const focusedTerminalId = activity.focusedTerminalId;
+      if (focusedTerminalId) {
+        const workspaceId = this.terminalManager?.getTerminal(focusedTerminalId)?.workspaceId;
+        if (workspaceId) workspaceIds.add(workspaceId);
+      }
+    }
+    return workspaceIds;
+  }
+
+  private async workspaceIdForAgent(agentId: string): Promise<string | null> {
+    const live = this.agentManager.getAgent(agentId);
+    if (live?.workspaceId) return live.workspaceId;
+    const stored = await this.agentStorage.get(agentId);
+    return stored?.workspaceId ?? null;
+  }
+
+  /** Workspace ids with a terminal session at or below their directory. */
+  private async terminalWorkspaceIds(
+    targets: readonly WorkspaceGitObservationTarget[],
+  ): Promise<Set<string>> {
+    const workspaceIds = new Set<string>();
+    const terminalManager = this.terminalManager;
+    if (!terminalManager) return workspaceIds;
+    for (const cwd of terminalManager.listDirectories()) {
+      for (const terminal of await terminalManager.getTerminals(cwd)) {
+        if (terminal.workspaceId) workspaceIds.add(terminal.workspaceId);
+        const owner = targets.find((target) =>
+          this.isPathWithinRoot(target.workspaceDirectory, terminal.cwd),
+        );
+        if (owner) workspaceIds.add(owner.id);
+      }
+    }
+    return workspaceIds;
+  }
+
+  /** A human prompt, a rename or a fresh workspace record inside the observation window. */
+  private async workspaceHadRecentActivity(
+    workspaceId: string,
+    lastPromptAtByWorkspaceId: ReadonlyMap<string, string>,
+  ): Promise<boolean> {
+    const record = await this.workspaceRegistry.get(workspaceId);
+    const timestamps = [
+      record?.createdAt,
+      record?.updatedAt,
+      lastPromptAtByWorkspaceId.get(workspaceId),
+    ];
+    const now = Date.now();
+    return timestamps.some((timestamp) => {
+      const parsed = timestamp ? Date.parse(timestamp) : Number.NaN;
+      return Number.isFinite(parsed) && now - parsed < WORKSPACE_GIT_OBSERVER_ACTIVITY_WINDOW_MS;
+    });
+  }
+
+  /**
+   * Arm one workspace's observer now, for the cases that make a quiet workspace live again: an
+   * agent loads in it, a terminal attaches, or a client opens it.
+   */
+  /** Whether any client is watching workspaces or their checkout status. */
+  private hasWorkspaceGitObservationDemand(): boolean {
+    return this.workspaceUpdatesSubscriptions.size > 0 || this.wantsEvent("checkout_status_update");
+  }
+
+  private async rearmWorkspaceGitObserver(workspaceId: string): Promise<void> {
+    if (this.observedWorkspaceGitIds.has(workspaceId)) return;
+    await this.syncWorkspaceGitObserversForExternalWorkspaceIds([workspaceId]);
+    // Remembered even when the sync no-ops for lack of demand: the reconcile that a new
+    // subscription triggers rebuilds this set from the workspaces themselves.
+    this.observedWorkspaceGitIds.add(workspaceId);
   }
 
   private seedWorkspaceSubscriptionSnapshot(
