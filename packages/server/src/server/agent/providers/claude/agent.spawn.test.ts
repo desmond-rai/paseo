@@ -34,11 +34,28 @@ function createQueryMock(events: unknown[]): Query {
   } as Query;
 }
 
-function createChildProcessStub(): ChildProcess {
-  const child = new EventEmitter() as ChildProcess;
+function createChildProcessStub(): ChildProcess & { killSignals: (NodeJS.Signals | number)[] } {
+  const child = new EventEmitter() as ChildProcess & {
+    killSignals: (NodeJS.Signals | number)[];
+  };
   child.stderr = new EventEmitter() as ChildProcess["stderr"];
+  child.killSignals = [];
+  // A real child dies when signalled; without this teardown waits out its timeouts.
+  child.kill = ((signal?: NodeJS.Signals | number) => {
+    child.killSignals.push(signal ?? "SIGTERM");
+    child.emit("exit", null, typeof signal === "string" ? signal : "SIGTERM");
+    return true;
+  }) as ChildProcess["kill"];
   return child;
 }
+
+const SPAWN_OPTIONS: ClaudeSpawnOptions = {
+  command: "node",
+  args: ["claude.js"],
+  cwd: process.cwd(),
+  env: {},
+  signal: new AbortController().signal,
+};
 
 describe("Claude spawn override", () => {
   afterEach(() => {
@@ -102,4 +119,39 @@ describe("Claude spawn override", () => {
     const spawnOptions = claudeSpawnCall?.[2];
     expect(spawnOptions?.shell).toBe(false);
   });
+});
+
+test("two concurrent launches share one Claude process, and close tears it down", async () => {
+  // Reopening a chat lists its commands while the client also asks for the provider's
+  // capabilities. Both are control-plane reads with no turn of their own, and both go through the
+  // same lazy launch. Without a single-flight guard each spawned its own `claude`, and `close()`
+  // only knew about the child that came second: the first one, and every MCP server under it,
+  // outlived the session.
+  const launchedOptions: Options[] = [];
+  const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
+    launchedOptions.push(options);
+    return createQueryMock([]);
+  });
+  const child = createChildProcessStub();
+  vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(child);
+  const client = new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  });
+  const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+
+  try {
+    const [first, second] = await Promise.all([session.listCommands!(), session.listCommands!()]);
+    expect(first).toEqual(second);
+    expect(queryFactory).toHaveBeenCalledTimes(1);
+
+    // Spawn through the same port production uses, once per launched query.
+    for (const options of launchedOptions) options.spawnClaudeCodeProcess?.(SPAWN_OPTIONS);
+    expect(launchedOptions).toHaveLength(1);
+  } finally {
+    await session.close();
+  }
+
+  expect(child.killSignals.length).toBeGreaterThan(0);
 });

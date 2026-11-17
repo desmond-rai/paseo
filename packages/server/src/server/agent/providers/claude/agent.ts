@@ -2399,6 +2399,8 @@ class ClaudeAgentSession implements AgentSession {
   private queryRestartNeeded = false;
   /** True from the moment a query's launch options are copied until the query exists. */
   private queryStarting = false;
+  /** The launch in flight, shared by every caller that asks for a query meanwhile. */
+  private queryStart: Promise<Query> | null = null;
   private pendingInterruptAbort = false;
   /**
    * Whether Claude's main session is inside one of its own turns: set by system/init and by a
@@ -3593,6 +3595,22 @@ class ClaudeAgentSession implements AgentSession {
       return this.query;
     }
 
+    // One launch at a time. Two control-plane reads can arrive together — a chat reopening lists
+    // its commands while the client asks for the provider's capabilities — and each used to
+    // launch its own process. The session kept only the child of the last launch, so closing it
+    // left the other `claude`, and every MCP server under it, running.
+    const inFlight = this.queryStart;
+    if (inFlight) return inFlight;
+    const start = this.launchQuery(launchMode);
+    this.queryStart = start;
+    const settled = () => {
+      if (this.queryStart === start) this.queryStart = null;
+    };
+    start.then(settled, settled);
+    return start;
+  }
+
+  private async launchQuery(launchMode: PermissionMode): Promise<Query> {
     if (this.queryRestartNeeded && this.query) {
       await this.retireQuery();
     }
